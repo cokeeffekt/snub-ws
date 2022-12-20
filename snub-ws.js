@@ -229,10 +229,7 @@ module.exports = function (config) {
         var idx = trackedClients.findIndex((tc) => tc.id === clientId);
         if (idx > -1) {
           var rClient = trackedClients.splice(idx, 1)[0];
-          var socketClient = socketClients.find(
-            (sc) => sc.state.id === clientId
-          );
-          if (socketClient) clients.push(rClient);
+          clients.push(rClient);
         }
       });
       if (clients.length)
