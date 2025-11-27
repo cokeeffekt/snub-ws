@@ -278,22 +278,28 @@ module.exports = function (config) {
     });
 
     async function getAllConnectedClientStates(idsOrUsernames) {
-      var instances = await aliveInstances();
-      const instancesClients = await snub
-        .poly('ws_internal:connected-clients', idsOrUsernames)
-        .awaitReply(1000, instances.length);
+      try {
+        var instances = await aliveInstances();
+        const instancesClients = await snub
+          .poly('ws_internal:connected-clients', idsOrUsernames)
+          .awaitReply(1000, instances.length);
 
-      if (instancesClients.length < instances.length)
-        console.warn(
-          'Snub-Ws: Not all instances replied to ws_internal:connected-clients',
-          instancesClients.length,
-          instances.length
-        );
-      const clients = [];
-      instancesClients.forEach((instance) => {
-        clients.push(...instance[1]);
-      });
-      return clients;
+        if (instancesClients.length < instances.length)
+          console.warn(
+            'Snub-Ws: Not all instances replied to ws_internal:connected-clients',
+            instancesClients.length,
+            instances.length
+          );
+        const clients = [];
+        instancesClients.forEach((instance) => {
+          clients.push(...instance[1]);
+        });
+        return clients;
+      }
+      catch (err) {
+        console.error(err)
+        return []
+      }
     }
 
     registerWsSnubEvent('get-clients:*', async (_, reply, idsOrUsernames) => {
@@ -309,15 +315,21 @@ module.exports = function (config) {
     });
 
     registerWsSnubEvent('channel-clients', async (channels, reply) => {
-      var instances = await aliveInstances();
-      const instancesClients = await snub
-        .poly('ws_internal:channel-clients', channels)
-        .awaitReply(1000, instances.length);
-      const clients = [];
-      instancesClients.forEach((instance) => {
-        clients.push(...instance[1]);
-      });
-      reply(clients);
+      try {
+        var instances = await aliveInstances();
+        const instancesClients = await snub
+          .poly('ws_internal:channel-clients', channels)
+          .awaitReply(1000, instances.length);
+        const clients = [];
+        instancesClients.forEach((instance) => {
+          clients.push(...instance[1]);
+        });
+        reply(clients);
+      }
+      catch (err) {
+        console.error(err)
+        reply([])
+      }
     });
 
     snub.on('ws_internal:dedupe-client-check', async (state) => {
@@ -543,8 +555,8 @@ class WsClient {
         .replyAt(
           reply
             ? (data) => {
-                this.send(reply, data);
-              }
+              this.send(reply, data);
+            }
             : undefined
         )
         .send((c) => {
