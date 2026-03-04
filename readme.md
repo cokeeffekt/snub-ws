@@ -1,245 +1,262 @@
-# Snub-WS
+# snub-ws
 
-Middleware WS server that allows you to run web-sockets over snub.
+WebSocket server middleware for [snub](https://github.com/cokeeffekt/snub).
 
-### Usage
+---
 
-`npm install snub`
+## Install
 
-`npm install snub-ws`
+```
+npm install snub snub-ws
+```
 
-### Basic Example
+Redis must be running and accessible.
 
-With redis installed and running with default port and no auth.
+---
 
-```javascript
+## Basic usage
+
+```js
 const Snub = require('snub');
-const snub = new Snub();
 const SnubWS = require('snub-ws');
 
-const snubws = new SnubWS(
-  debug: true
-);
+const snub = new Snub({ host: 'localhost' });
 
-snub.use(snubws);
-
+snub.use(SnubWS({ port: 8585, auth: false }));
 ```
 
-### Config options
+---
 
-```javascript
-{
-  port: 8585, // Web-socket server port
-  debug: true, // Bool, turns on verbose messaging.
-  mutliLogin: true, // Bool, can the same username connection more than once?
-  auth: 'auth-event', // String OR Function OR bool for no auth required
-  authTimeout: 3000, // how long to wait for the client to auth before disconnecting
-  throttle: [50, 5000], // X number of messages per Y milliseconds before disconnecting
-  idleTimeout: 1000 * 60 * 60, // how long can an idle client be connected
-}
+## Config
+
+```js
+SnubWS({
+  port: 8585,               // WebSocket server port
+  auth: false,              // Auth handler — see Auth section below
+  debug: false,             // Log verbose info
+  multiLogin: true,         // Allow same username to connect more than once
+  authTimeout: 3000,        // Ms before unauthenticated client is kicked
+  throttle: [50, 5000],     // [maxMessages, windowMs] — false to disable
+  idleTimeout: 960000,      // Ms before idle client is kicked (min 5min, max 960s)
+  allowedOrigins: null,     // Array of allowed origins e.g. ['https://example.com'], null = allow all
+  maxConnections: 0,        // Max simultaneous connections, 0 = unlimited
+  maxPayloadLength: 16777216,   // Max inbound message size in bytes (16 MB)
+  maxQueueSize: 100,        // Max queued messages under backpressure before kicking
+  maxBackpressure: 1048576, // Max outbound buffer in bytes (1 MB)
+  offloadToHttpSize: 524288,// Messages larger than this (bytes) are offloaded to HTTP (0.5 MB)
+  includeRaw: false,        // Include raw message string in snub payload (true or array of event names)
+  internalWsEvents: [],     // Extra event names clients are blocked from sending
+});
 ```
 
-### Auth Config extra
+---
 
-auth can be passed 1 of 3 things
+## Auth
 
-#### Function
+### No auth
 
-A function passed to auth
+```js
+SnubWS({ auth: false })
+```
 
-```javascript
-{
-  auth: function (auth, accept) {
-    if (auth.username == 'username')
-      return accept(true); // run accept to authenticate the web-socket client connection.
-    accept(false); // run with false to decline the web-socket connection and disconnect the client.
+All clients are accepted automatically.
+
+### Function
+
+```js
+SnubWS({
+  auth: function (authPayload, accept) {
+    if (authPayload.username && authPayload.password === 'secret')
+      return accept(true);
+    accept(false);
   }
-}
+})
 ```
 
-#### Snub event
+`accept` can be called with:
+- `true` — accept with no extra data
+- `false` — deny (client is kicked)
+- `object` — accept and merge into the `_acceptAuth` reply sent to client
 
-```javascript
-{
-  auth: 'authenticate-client';
-}
-```
+### Snub event
 
-```javascript
-snub.on('ws:authenticate-client', function (auth, accept) {
-  // console.log(auth);
-  if (auth.username == 'username') return accept(true);
+```js
+SnubWS({ auth: 'authenticate-client' })
+
+snub.on('ws:authenticate-client', function (authPayload, reply) {
+  if (authPayload.username === 'admin') return reply(true);
   reply(false);
 });
 ```
 
-TODO docs
+---
 
-#### False for no auth
+## Client protocol
 
-### Authenticating a client
+Messages are JSON-encoded arrays: `[eventName, payload?, replyId?]`
 
-The first thing a client should do after connecting is send an authenitication message.
-username is required, the entire object will be passed to your authentication method.
+### Authenticate
 
-```
-['_auth', { username, password}];
-```
+The first message a client should send after connecting (required when `auth` is not `false`):
 
-### Sending messages from the client
-
-Web socket message objects should be JSON stringified arrays. The first item is always the event name followed by payload, followed by the replyId. Only event name is required.
-
-```
-['event-name', { payload }, replyId];
+```json
+["_auth", { "username": "alice", "password": "secret" }]
 ```
 
-#### String
+On success the server responds with:
 
-A string passed to auth will run the method as a snub event. Reply true or false.
+```json
+["_acceptAuth", { "_id": "connectionId" }]
+```
 
-```javascript
+### Send a message
+
+```json
+["event-name", { "any": "payload" }, "optional-reply-id"]
+```
+
+---
+
+## Server → Client events (snub API)
+
+### Send to specific clients
+
+```js
+// by username or connection ID (comma-separate for multiple)
+snub.poly('ws:send:alice', ['event-name', payload]).send();
+snub.poly('ws:send:alice,bob', ['event-name', payload]).send();
+snub.poly('ws:send:' + connectionId, ['event-name', payload]).send();
+```
+
+### Send to all clients
+
+```js
+snub.poly('ws:send-all', ['event-name', payload]).send();
+
+// filter to specific usernames/IDs
+snub.poly('ws:send-all', ['event-name', payload, ['alice', 'bob']]).send();
+```
+
+### Send to a channel
+
+```js
+snub.poly('ws:send-channel:my-channel', ['event-name', payload]).send();
+
+// multiple channels
+snub.poly('ws:send-channel:ch1,ch2', ['event-name', payload]).send();
+
+// inline channel list
+snub.poly('ws:send-channel', ['event-name', payload, ['ch1', 'ch2']]).send();
+```
+
+### Kick clients
+
+```js
+// by username or ID
+snub.poly('ws:kick:alice', 'reason').send();
+snub.poly('ws:kick:alice,bob', 'reason').send();
+
+// with WebSocket close code
+snub.poly('ws:kick', ['alice', 'reason', 1008]).send();
+
+// all connected clients
+snub.poly('ws:kick-all', 'reason').send();
+```
+
+---
+
+## Channels
+
+```js
+snub.poly('ws:add-channel:alice', ['room1', 'room2']).send(); // add channels
+snub.poly('ws:del-channel:alice', ['room1']).send();          // remove channels
+snub.poly('ws:set-channel:alice', ['room1']).send();          // replace all channels
+```
+
+---
+
+## Meta
+
+Arbitrary key/value data attached to a client, included in all `from` payloads.
+
+```js
+// set by username or ID
+snub.poly('ws:set-meta:alice', { role: 'admin', plan: 'pro' }).send();
+
+// set for multiple clients by list
+snub.poly('ws:set-meta', [{ role: 'guest' }, ['alice', 'bob']]).send();
+```
+
+---
+
+## Query
+
+```js
+// get client states by username/ID
+const clients = await snub.mono('ws:get-clients:alice,bob').awaitReply();
+const clients = await snub.mono('ws:get-clients', ['alice', 'bob']).awaitReply();
+
+// get all connected clients (optionally filtered)
+const all = await snub.mono('ws:connected-clients').awaitReply();
+const some = await snub.mono('ws:connected-clients', ['alice']).awaitReply();
+
+// get clients in a channel
+const inRoom = await snub.mono('ws:channel-clients', ['room1']).awaitReply();
+```
+
+Each client state has this shape:
+
+```js
 {
-  auth: 'authenticate-client';
+  id: 'connectionId',
+  username: 'alice',
+  channels: ['room1'],
+  authenticated: true,
+  connectTime: 1710000000000,
+  remoteAddress: '127.0.0.1',
+  lastMsgTime: 1710000001234,
+  meta: {}
 }
+```
 
-snub.on('ws:authenticate-client', function (auth, reply) {
-  console.log(auth);
-  if (auth.username == 'username') return reply(true);
-  reply(false);
+---
+
+## Client → Server events (snub listeners)
+
+Inbound messages from clients are forwarded to snub with the `ws:` prefix.
+
+```js
+snub.on('ws:my-event', function (event, reply) {
+  console.log(event.from);    // client state
+  console.log(event.payload); // message payload
+  reply('response');          // optional reply back to client
 });
 ```
 
-#### Boolean
+---
 
-A bool with false will authenticate any web-socket client connection.
+## Server-emitted snub events
 
-```javascript
-{
-  auth: false;
-}
+| Event | Type | Description |
+|-------|------|-------------|
+| `ws:client-authenticated` | mono | Fired when a client successfully authenticates |
+| `ws:client-disconnected` | mono | Fired when a client disconnects |
+| `ws:client-updated` | mono | Fired when a client's state changes (meta, channels) |
+
+---
+
+## Large message offloading
+
+When `offloadToHttpSize` is set and a message exceeds that size, the server stores the payload in Redis (30s TTL) and sends the client a redirect:
+
+```json
+["_offload", "offloadId"]
 ```
 
-### Events
-
-#### Client > Server
-
-When a client sends data to the server the event will be prefixed with **ws:**
-
-```javascript
-{
-  from: { // client socket info
-    id: '89668-mnm4i6', // unique uuid generated by snub-ws
-    username: 'username', // defined in auth
-    channels: [], // clients channel list
-    connected: true, // connection status
-    authenticated: true, // auth status
-    connectTime: 1583803891546, // timestamp
-    remoteAddress: '::1', // clients ip address
-    meta: {} // client meta obj
-  },
-  payload: {}, // payload from client
-  _ts: 1583803922264 // timestamp
-}
+The client should then fetch:
 
 ```
-
-Simple snub listener. inbound messages from client will be prefixed with **ws:**
-
-```javascript
-snub.on('ws:do-math', function (event, reply) {
-  console.log('domath');
-  reply(event.payload * 10);
-});
+GET http://hostname:port/?offload=<offloadId>
 ```
 
-#### Server > Client
-
-Send event to all clients
-
-```javascript
-snub.poly('ws:send-all', ['event-name', { payload }]).send();
-```
-
-Send event to channel
-
-```javascript
-snub.poly('ws:send-channel:' + 'channel6', ['event-name', { payload }]).send();
-```
-
-Send event to multiple channels
-
-```javascript
-snub
-  .poly('ws:send-channel:' + ['channel6', 'channel2', 'channel3'].join(','), [
-    'event-name',
-    { payload },
-  ])
-  .send();
-```
-
-Send event to client
-
-```javascript
-snub.poly('ws:send:' + 'username', ['event-name', { payload }]).send();
-// or
-snub.poly('ws:send:' + event.from.id, ['event-name', { payload }]).send();
-```
-
-Send event to multiple clients
-
-```javascript
-snub
-  .poly('ws:send-some, [
-    'event-name',
-    ['user1', 'user2', 'user3']
-    { payload },
-  ])
-  .send();
-```
-
-```javascript
-// use this only for a small amount of users.
-snub
-  .poly('ws:send:' + ['user1', 'user2', 'user3'].join(','), [
-    'event-name',
-    { payload },
-  ])
-  .send();
-```
-
-### Channels
-
-```javascript
-snub.poly('ws:add-channel:' + 'username', ['channel1', 'channel2']).send(); // add to existing channels
-snub.poly('ws:set-channel:' + 'username', ['channel1', 'channel2']).send(); // wipes and sets channels
-snub.poly('ws:del-channel:' + 'username', ['channel1', 'channel2']).send(); // removes channels
-
-// send to channel
-snub.poly('ws:send-channel:' + 'channel6', ['event-name', { payload }]).send();
-```
-
-### Meta
-
-You can set meta against a client, which will be availbe in the **event.from.meta** object
-
-```javascript
-snub.poly('ws:set-meta:' + 'username', { prop1: 'AOK' }).send();
-```
-
-```javascript
-snub
-  .mono('ws:get-clients:' + 'usernameOrId')
-  .replyAt((clients) => {
-    // clients = Array of client states Inludes client.meta
-  })
-  .send();
-```
-
-### WS Client emitted events
-
-`ws:connected-clients-update` will be poly emitted when client connects or client state changes.
-`ws:connected-clients-update` mono emitted as above
-
-`ws:connected-clients-offline` will be poly emitted with client state as payload when client disconects
-`ws:connected-clients-offline-mono` mono emitted event as above
+The response is the full JSON message payload.

@@ -1,4 +1,5 @@
 const uWS = require('uWebSockets.js');
+const { randomBytes } = require('crypto');
 
 const DEFAULT_CONFIG = {
   port: 8585,
@@ -7,11 +8,15 @@ const DEFAULT_CONFIG = {
   multiLogin: true, // can the same user be connected more than once
   authTimeout: 3000,
   throttle: [50, 5000], // X number of messages per Y milliseconds.
-  idleTimeout: 1000 * 60 * 60, // disconnect if nothing has come from client in x ms 1 hour default
+  idleTimeout: 960 * 1000, // disconnect if nothing has come from client in x ms (uWS v20 max: 960 seconds)
+  allowedOrigins: null, // array of allowed origins e.g. ['https://example.com'], null = allow all
+  maxConnections: 0, // max simultaneous connections, 0 = unlimited
   instanceId: process.pid,
   includeRaw: false, // for including raw client messages, debug purposes only.
   error: (_) => {},
   internalWsEvents: [],
+  maxPayloadLength: 16 * 1024 * 1024, // max incoming message size in bytes
+  maxQueueSize: 100, // max messages to queue when client is under backpressure before kicking
   maxBackpressure: 1 * 1024 * 1024, // memory limit for backpressure
   offloadToHttpSize: 0.5 * 1024 * 1024, // if message is larger than this, offload to http
 };
@@ -22,8 +27,8 @@ module.exports = function (config) {
     ...DEFAULT_CONFIG,
     ...config,
   };
-  config.idleTimeout = Math.max(config.idleTimeout, 1000 * 60 * 5); // min 5 minute on idle timeout
-  config.idleTimeout = Math.min(959000, config.idleTimeout);
+  config.idleTimeout = Math.max(config.idleTimeout, 1000 * 60 * 5); // min 5 minutes
+  config.idleTimeout = Math.min(960 * 1000, config.idleTimeout); // uWS v20 max 960 seconds
 
   config.offloadToHttpSize =
     config.offloadToHttpSize < 1 ? null : config.offloadToHttpSize;
@@ -78,20 +83,31 @@ module.exports = function (config) {
     }
 
     async function aliveInstances() {
-      const now = Date.now();
-      const instances = await snub.redis.zrangebyscore(
-        '_snubws_instance',
-        now,
-        '+inf'
-      );
-      snub.redis.zremrangebyscore('_snubws_instance', '-inf', now);
-      return instances;
+      try {
+        const now = Date.now();
+        const instances = await snub.redis.zrangebyscore(
+          '_snubws_instance',
+          now,
+          '+inf'
+        );
+        await snub.redis.zremrangebyscore('_snubws_instance', '-inf', now);
+        return instances;
+      } catch (error) {
+        console.error('Snub-Ws: Redis error in aliveInstances', error);
+        return [];
+      }
     }
 
-    process.on('SIGINT', async (_) => {
+    async function shutdown() {
+      wsClients.clients().forEach((client) => client.kick('SERVER_SHUTDOWN'));
+      await new Promise((resolve) => setTimeout(resolve, 500));
       await snub.redis.zrem('_snubws_instance', config.instanceId);
       process.exit(0);
-    });
+    }
+
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    process.on('SIGUSR2', shutdown);
 
     const socketServer = uWS
       .App()
@@ -138,12 +154,30 @@ module.exports = function (config) {
         compression: config.compression
           ? uWS[config.compression]
           : uWS.SHARED_COMPRESSOR,
-        maxPayloadLength: 16 * 1024 * 1024,
+        maxPayloadLength: config.maxPayloadLength,
         idleTimeout: config.idleTimeout / 1000,
         maxBackpressure: config.maxBackpressure || 1 * 1024 * 1024,
         //: 2 * 1024 * 1024,
         /* Handlers */
         upgrade: (res, req, ctx) => {
+          const origin = req.getHeader('origin');
+
+          if (
+            config.allowedOrigins &&
+            !config.allowedOrigins.includes(origin)
+          ) {
+            res.writeStatus('403 Forbidden').end('Forbidden');
+            return;
+          }
+
+          if (
+            config.maxConnections > 0 &&
+            wsClients.clients().length >= config.maxConnections
+          ) {
+            res.writeStatus('503 Service Unavailable').end('Too many connections');
+            return;
+          }
+
           let basicAuth = false;
           try {
             basicAuth = Buffer.from(
@@ -157,16 +191,21 @@ module.exports = function (config) {
               password: basicAuth[1],
             };
           } catch (error) {}
+
+          const remoteAddress =
+            req.getHeader('x-forwarded-for') ||
+            req.getHeader('x-real-ip') ||
+            Buffer.from(res.getRemoteAddressAsText()).toString();
+
           var obj = {
             key: req.getHeader('sec-websocket-key'),
             url: req.getUrl(),
             basicAuth: basicAuth,
             wsMeta: {
               url: req.getUrl(),
-              origin: req.getHeader('origin'),
+              origin,
               host: req.getHeader('host'),
-              remoteAddress:
-                req.getHeader('x-forwarded-for') || req.getHeader('x-real-ip'),
+              remoteAddress,
               cookie: req.getHeader('cookie'),
             },
           };
@@ -261,6 +300,14 @@ module.exports = function (config) {
       }
     );
 
+    registerWsSnubEvent(
+      'set-channel:*',
+      (arrayOfChannels, reply, idsOrUsernames) => {
+        const clients = wsClients.clients(idsOrUsernames);
+        clients.setChannel(arrayOfChannels);
+      }
+    );
+
     registerWsSnubEvent('kick-all', (message, reply, idsOrUsernames) => {
       const clients = wsClients.clients(idsOrUsernames);
       clients.kick(message);
@@ -274,7 +321,7 @@ module.exports = function (config) {
 
     registerWsSnubEvent('kick:*', (payload, reply, idsOrUsernames) => {
       const clients = wsClients.clients(idsOrUsernames);
-      clients.kick(payload.message);
+      clients.kick(payload);
     });
 
     async function getAllConnectedClientStates(idsOrUsernames) {
@@ -402,9 +449,14 @@ class ClientMap extends Map {
       ws.delChannel(arrayOfChannels);
     });
   }
-  kick(reason) {
+  setChannel(arrayOfChannels) {
     this.forEach((ws) => {
-      ws.kick(reason);
+      ws.setChannel(arrayOfChannels);
+    });
+  }
+  kick(reason, code) {
+    this.forEach((ws) => {
+      ws.kick(reason, code);
     });
   }
 }
@@ -456,11 +508,14 @@ class WsClient {
     id: null,
     connectTime: Date.now(),
     lastMsgTime: Date.now(),
+    lastSendTime: 0,
+    lastMsgHash: null,
     channels: new Set(),
     metaObj: {},
     auth: {},
     authenticated: false,
-    recent: [],
+    recent: null,
+    recentIdx: 0,
     closing: false,
     wsMeta: {},
   };
@@ -481,6 +536,8 @@ class WsClient {
     clients.set(this.#internal.id, this);
 
     this.#internal.wsMeta = ws.wsMeta;
+    if (config.throttle)
+      this.#internal.recent = new Array(config.throttle[0]).fill(0);
 
     if (ws.basicAuth) {
       this.#validateAuth(ws.basicAuth);
@@ -530,13 +587,13 @@ class WsClient {
     //@todo prevent client from sending internal events
 
     if (this.#config.throttle) {
-      this.#internal.recent = this.#internal.recent.filter(
-        (ts) => ts > Date.now() - this.#config.throttle[1]
-      );
-      if (this.#internal.recent.length > this.#config.throttle[0]) {
+      const oldest = this.#internal.recent[this.#internal.recentIdx];
+      if (oldest > Date.now() - this.#config.throttle[1]) {
         return this.kick('THROTTLE_LIMIT');
       }
-      this.#internal.recent.push(Date.now());
+      this.#internal.recent[this.#internal.recentIdx] = Date.now();
+      this.#internal.recentIdx =
+        (this.#internal.recentIdx + 1) % this.#config.throttle[0];
     }
 
     const includeRaw =
@@ -572,7 +629,7 @@ class WsClient {
   }
 
   onDrain() {
-    console.log('Snub-Ws: Drain');
+    if (this.#config.debug) console.log('Snub-Ws: Drain');
     while (this.#messageQueue.length > 0) {
       const message = this.#messageQueue.shift();
       if (!this.#ws.send(message)) {
@@ -587,6 +644,7 @@ class WsClient {
 
   onClose(code, message) {
     this.#internal.closing = true;
+    clearTimeout(this.#authTimeout);
     message = Buffer.from(message).toString();
     this.#clients.delete(this.#internal.id);
     snub.mono('ws:client-disconnected', this.state).send();
@@ -600,31 +658,38 @@ class WsClient {
     // dont send the same message twice in a row within 3 seconds
     if (
       msgHash === this.#internal.lastMsgHash &&
-      Date.now() - this.#internal.lastMsgTime < 3000
+      Date.now() - this.#internal.lastSendTime < 3000
     ) {
       return;
     }
 
     this.#internal.lastMsgHash = msgHash;
+    this.#internal.lastSendTime = Date.now();
     if (this.#internal.closing) return;
 
     if (
       this.#config.offloadToHttpSize &&
       Buffer.byteLength(sendString, 'utf8') > this.#config.offloadToHttpSize
     ) {
-      console.log('Snub-Ws: Offloading to HTTP', event, sendString.length);
-      const offloadId = snub.generateUID();
+      if(this.#config.debug)
+        console.log('Snub-Ws: Offloading to HTTP', event, Buffer.byteLength(sendString, 'utf8'), sendString.length);
+      const offloadId = randomBytes(16).toString('hex');
       snub.redis.set('_snubws_offload:' + offloadId, sendString, 'EX', 30);
       this.#ws.send(snub.stringifyJson(['_offload', offloadId]));
       return;
     }
 
     if (!this.#ws.send(sendString)) {
-      console.warn(
-        'Snub-Ws: Backpressure detected',
-        event,
-        this.#ws.getBufferedAmount()
-      );
+      if (this.#messageQueue.length >= this.#config.maxQueueSize) {
+        this.#messageQueue = [];
+        return this.kick('QUEUE_OVERFLOW');
+      }
+      if (this.#config.debug)
+        console.warn(
+          'Snub-Ws: Backpressure detected',
+          event,
+          this.#ws.getBufferedAmount()
+        );
       this.#messageQueue.push(sendString);
     }
   }
@@ -678,6 +743,12 @@ class WsClient {
     arrayOfChannels.forEach((channel) => {
       this.#internal.channels.delete(channel);
     });
+  }
+
+  setChannel(arrayOfChannels) {
+    if (typeof arrayOfChannels === 'string')
+      arrayOfChannels = [arrayOfChannels];
+    this.#internal.channels = new Set(arrayOfChannels);
   }
 
   kick(reason, code = 1000) {
@@ -762,7 +833,7 @@ class WsClient {
   }
 }
 
-normalizeStringArray = (strOrArray) => {
+const normalizeStringArray = (strOrArray) => {
   if (!strOrArray) return strOrArray;
   if (typeof strOrArray === 'string') return [strOrArray];
   if (Array.isArray(strOrArray)) return strOrArray;

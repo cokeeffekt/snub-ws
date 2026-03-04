@@ -1,6 +1,17 @@
+jest.mock('ioredis', () => {
+  const IORedisMock = require('ioredis-mock');
+  class RedisMock extends IORedisMock {
+    client() {
+      return Promise.resolve('OK');
+    }
+  }
+  return RedisMock;
+});
+
 const Snub = require('snub');
 const SnubWS = require('./snub-ws.js');
 const WebSocket = require('ws');
+const http = require('http');
 var snub = new Snub({
   host: 'localhost',
   password: '',
@@ -63,6 +74,29 @@ snub.use(snubws1);
 snub.use(snubws2);
 snub.use(snubws3);
 snub.use(snubwsNA);
+
+const snubwsThrottle = new SnubWS({
+  debug: false,
+  port: 9001,
+  auth: auth,
+  throttle: [3, 1000],
+});
+snub.use(snubwsThrottle);
+
+const snubwsOffload = new SnubWS({
+  debug: false,
+  port: 9002,
+  auth: false,
+  offloadToHttpSize: 100,
+});
+snub.use(snubwsOffload);
+
+var snub2 = new Snub({
+  host: 'localhost',
+  password: '',
+  db: 8,
+  timeout: 10000,
+});
 
 test('Connect/Disconnect to snub-ws web socket server with basic auth', async function () {
   let didAuth = false;
@@ -198,7 +232,7 @@ test('Bulk connections', async function () {
 
   const connections = new Map();
 
-  starTrekCharacters.forEach((character) => {
+  function connectCharacter(character) {
     var socketClient = new Ws('ws://localhost:' + nextPort(), {
       onopen: (e) => {
         socketClient.json([
@@ -211,7 +245,6 @@ test('Bulk connections', async function () {
         if (key === '_acceptAuth') {
           tokenCheck = value.token;
           didAuth++;
-
           socketClient.json(['double-me', 6, 'qwerty456']);
           return;
         }
@@ -227,20 +260,29 @@ test('Bulk connections', async function () {
           blockCheck++;
           return;
         }
-
         if (key === 'qwerty456') {
           doubleMe = value;
           return;
         }
-
         console.log('Message:', key, value);
       },
       onerror: (e) => console.warn('Error:', e),
     });
     connections.set(character, socketClient);
-  });
+  }
 
-  await justWait(200);
+  // Create the first 18 unique connections, then wait for them all to
+  // authenticate before connecting the duplicates (jadzia-dax, kira-nerys).
+  // This guarantees each 1st occurrence is in the authenticated map when its
+  // 2nd occurrence fires the dedup check, eliminating the auth-ordering race.
+  for (let i = 0; i < starTrekCharacters.length; i++) {
+    if (i === 18) await waitFor(() => didAuth >= 18);
+    connectCharacter(starTrekCharacters[i]);
+  }
+
+  // wait for all 22 to auth, then allow dedup kicks + close handshakes to settle
+  await waitFor(() => didAuth >= 22);
+  await justWait(500);
 
   expect(tokenCheck).toBe('123456');
   expect(doubleMe).toBe(12);
@@ -254,19 +296,16 @@ test('Bulk connections', async function () {
   let trekClients = await snub
     .mono('ws:connected-clients', starTrekCharacters)
     .awaitReply();
-  await justWait(200);
   expect(trekClients.length).toBe(20);
 
   // kick some clients
   snub.poly('ws:kick:odo,quark', 'test-kick').send();
-  await justWait(500);
+  await waitFor(() => disconnectCount >= 4);
 
   // check if some clients are kicked
   trekClients = await snub
     .mono('ws:connected-clients', starTrekCharacters)
     .awaitReply();
-  await justWait(200);
-
   expect(trekClients.length).toBe(18);
 
   // send all test
@@ -365,17 +404,13 @@ test('Bulk connections', async function () {
 
  
 
-  await justWait(200);
-
   // close connections from client
   connections.get('william-riker').close();
   connections.get('data').close();
-  await justWait(200);
+  await waitFor(() => disconnectCount >= 6);
   trekClients = await snub
     .mono('ws:connected-clients', starTrekCharacters)
     .awaitReply();
-  await justWait(200);
-
   expect(trekClients.length).toBe(16);
 
   expect(didAuth).toBe(22);
@@ -383,6 +418,141 @@ test('Bulk connections', async function () {
   expect(disconnectCount).toBe(6);
   expect(updateCount).toBe(11);
 }, 15000);
+
+test('kick:* passes kick reason to client (B5 regression)', async function () {
+  let clientId = null;
+  let kickReason = null;
+
+  const client = new Ws('ws://localhost:8585', {
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+      if (key === '_kickConnection') kickReason = value;
+    },
+  });
+
+  await justWait(300);
+  expect(clientId).not.toBeNull();
+
+  snub.poly('ws:kick:' + clientId, 'kick-reason-test').send();
+  await justWait(300);
+
+  expect(kickReason).toBe('kick-reason-test');
+  client.close();
+}, 5000);
+
+test('Outbound dedup suppresses identical messages within 3s, resets after (B4 regression)', async function () {
+  let clientId = null;
+  let received = 0;
+
+  const client = new Ws('ws://localhost:8585', {
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+      if (key === 'dedup-test') received++;
+    },
+  });
+
+  await justWait(300);
+  expect(clientId).not.toBeNull();
+
+  // Send identical message twice back-to-back — second should be deduped
+  snub.poly('ws:send:' + clientId, ['dedup-test', 'payload']).send();
+  snub.poly('ws:send:' + clientId, ['dedup-test', 'payload']).send();
+  await justWait(200);
+  expect(received).toBe(1);
+
+  // After the 3s window expires the same message should be delivered again
+  await justWait(3000);
+  snub.poly('ws:send:' + clientId, ['dedup-test', 'payload']).send();
+  await justWait(200);
+  expect(received).toBe(2);
+
+  client.close();
+}, 10000);
+
+test('Throttle kicks client after exceeding message rate limit (M17)', async function () {
+  let clientId = null;
+  let kickReason = null;
+
+  const client = new Ws('ws://localhost:9001', {
+    onopen: () => client.json(['_auth', { username: 'throttle-test', password: 'password' }]),
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+      if (key === '_kickConnection') kickReason = value;
+    },
+  });
+
+  await waitFor(() => clientId !== null);
+
+  // Send 4 messages rapidly — 4th exceeds throttle limit of 3 per 1000ms
+  client.json(['msg', 1]);
+  client.json(['msg', 2]);
+  client.json(['msg', 3]);
+  client.json(['msg', 4]);
+
+  await waitFor(() => kickReason !== null);
+  expect(kickReason).toBe('THROTTLE_LIMIT');
+}, 5000);
+
+test('Large messages are offloaded to HTTP and retrievable (M19)', async function () {
+  // snubwsOffload uses auth:false so clients are auto-authenticated on connect
+  let clientId = null;
+  let offloadId = null;
+
+  const client = new Ws('ws://localhost:9002', {
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+      if (key === '_offload') offloadId = value;
+    },
+  });
+
+  await waitFor(() => clientId !== null);
+
+  // Send a message larger than offloadToHttpSize (50 bytes)
+  const largePayload = 'x'.repeat(200);
+  snub.poly('ws:send:' + clientId, ['big-event', largePayload]).send();
+
+  await waitFor(() => offloadId !== null);
+
+  const body = await new Promise((resolve, reject) => {
+    http.get('http://localhost:9002/?offload=' + offloadId, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve(data));
+    }).on('error', reject);
+  });
+
+  const [event, payload] = JSON.parse(body);
+  expect(event).toBe('big-event');
+  expect(payload).toBe(largePayload);
+
+  client.close();
+}, 10000);
+
+test('Messages sent from a second snub instance reach connected clients (M20)', async function () {
+  let clientId = null;
+  let received = null;
+
+  const client = new Ws('ws://localhost:8585', {
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+      if (key === 'cross-instance') received = value;
+    },
+  });
+
+  await waitFor(() => clientId !== null);
+
+  snub2.poly('ws:send:' + clientId, ['cross-instance', 'hello-from-snub2']).send();
+
+  await waitFor(() => received !== null);
+  expect(received).toBe('hello-from-snub2');
+
+  client.close();
+}, 5000);
 
 // helper functions
 
@@ -480,5 +650,18 @@ function Ws(url, opts) {
 function justWait(ms = 1000) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+function waitFor(condition, timeout = 5000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      if (condition()) return resolve();
+      if (Date.now() - start > timeout)
+        return reject(new Error('waitFor timeout: ' + condition.toString()));
+      setTimeout(check, 50);
+    };
+    check();
   });
 }

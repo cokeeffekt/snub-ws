@@ -1,0 +1,13 @@
+# Dev / CI
+.claude/
+audit/
+node_modules/
+package-lock.json
+prettier.config.js
+.nvmrc
+
+# Tests
+snub-ws.test.js
+
+# Examples
+examples/
