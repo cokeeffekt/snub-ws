@@ -1,4 +1,34 @@
-const uWS = require('uWebSockets.js');
+// uWebSockets.js ships prebuilt binaries keyed on Node's ABI (process.versions.modules) and
+// has no source-build fallback, so a release can only load on the Node versions it was built
+// for. No single release spans the range we support, so two pinned builds are installed under
+// aliases and we take whichever one loads:
+//   uws-modern  v20.69.0 -> Node 22, 24, 26
+//   uws-legacy  v20.51.0 -> Node 18, 20, 22, 23
+// Modern is tried first so Node 22, which both cover, gets the newer build.
+const uWS = (() => {
+  const errors = [];
+  for (const name of ['uws-modern', 'uws-legacy']) {
+    try {
+      return require(name);
+    } catch (err) {
+      errors.push(
+        '  ' + name + ': ' + String(err && err.message).split('\n')[0]
+      );
+    }
+  }
+  throw new Error(
+    'snub-ws: no usable uWebSockets.js build for Node ' +
+      process.version +
+      ' (ABI ' +
+      process.versions.modules +
+      ', ' +
+      process.platform +
+      ' ' +
+      process.arch +
+      ').\nSupported: Node 18, 20, 22, 23, 24, 26 on glibc Linux, macOS and Windows.\n' +
+      errors.join('\n')
+  );
+})();
 const { randomBytes } = require('crypto');
 
 const DEFAULT_CONFIG = {
@@ -109,14 +139,58 @@ module.exports = function (config) {
     process.on('SIGTERM', shutdown);
     process.on('SIGUSR2', shutdown);
 
+    // A browser always fetches offload bodies cross-origin: the client derives
+    // the URL from the ws url, and an origin includes the port, so a page on
+    // :3000 reading from a socket on :8585 is cross-origin by construction.
+    // Without these headers Chrome blocks the read and the offloaded message is
+    // dropped with no retry. Must be called after writeStatus() — uWS emits
+    // headers in call order and ignores a status written after one.
+    function writeCorsHeaders(res, origin) {
+      if (!config.allowedOrigins) {
+        res.writeHeader('Access-Control-Allow-Origin', '*');
+        return;
+      }
+      // Origins are already restricted for the socket itself, so mirror that
+      // here rather than widening the offload route to every origin. An origin
+      // that is not allowed simply gets no header, and the browser blocks it.
+      if (origin && config.allowedOrigins.includes(origin)) {
+        res.writeHeader('Access-Control-Allow-Origin', origin);
+        res.writeHeader('Vary', 'Origin');
+      }
+    }
+
     const socketServer = uWS
       .App()
+      .options('/*', (res, req) => {
+        // The client's offload fetch is a simple GET and is not preflighted,
+        // but anything that adds a header would be.
+        const origin = req.getHeader('origin');
+        res.onAborted(() => {
+          res.aborted = true;
+        });
+        // corked: uWS warns once a response makes several uncorked writes, and
+        // these responses are now several headers deep
+        res.cork(() => {
+          res.writeStatus('204 No Content');
+          writeCorsHeaders(res, origin);
+          res.writeHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+          res.writeHeader('Access-Control-Allow-Headers', 'Content-Type');
+          res.writeHeader('Access-Control-Max-Age', '86400');
+          res.end();
+        });
+      })
       .get('/*', (res, req) => {
         res.onAborted(() => {
+          // The guards below already assume this flag; without it they never
+          // fire and a client that disconnects mid-lookup gets written to.
+          res.aborted = true;
           console.log('Request aborted');
         });
         // Retrieve the raw query string
         const query = req.getQuery(); // For example: "offload=1233"
+        // `req` is invalid once this handler yields, so anything the async
+        // continuation needs has to be read now.
+        const origin = req.getHeader('origin');
 
         // Parse the query string into a usable object
         const params = Object.fromEntries(new URLSearchParams(query));
@@ -124,9 +198,12 @@ module.exports = function (config) {
 
         function fail() {
           if (res.aborted) return;
-          res.writeHeader('Content-Type', 'text/plain');
-          res.writeStatus('404 Not Found');
-          res.end('404: Route not found');
+          res.cork(() => {
+            res.writeStatus('404 Not Found');
+            writeCorsHeaders(res, origin);
+            res.writeHeader('Content-Type', 'text/plain');
+            res.end('404: Route not found');
+          });
         }
 
         if (params.offload) {
@@ -136,8 +213,11 @@ module.exports = function (config) {
             .then((offloadData) => {
               if (res.aborted) return;
               if (offloadData) {
-                res.writeHeader('Content-Type', 'application/json');
-                res.end(offloadData);
+                res.cork(() => {
+                  writeCorsHeaders(res, origin);
+                  res.writeHeader('Content-Type', 'application/json');
+                  res.end(offloadData);
+                });
                 return;
               }
               fail();
@@ -172,7 +252,7 @@ module.exports = function (config) {
 
           if (
             config.maxConnections > 0 &&
-            wsClients.clients().length >= config.maxConnections
+            wsClients.count >= config.maxConnections
           ) {
             res.writeStatus('503 Service Unavailable').end('Too many connections');
             return;
@@ -468,6 +548,10 @@ class WsClients {
   constructor(config) {
     this.#config = config;
     this.#clients = new Map();
+  }
+
+  get count() {
+    return this.#clients.size;
   }
 
   clients(idsOrUsernames) {

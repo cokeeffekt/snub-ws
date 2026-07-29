@@ -1,13 +1,17 @@
 {
   "name": "snub-ws",
-  "version": "4.2.1",
+  "version": "5.0.0",
   "description": "WebSocket server middleware for snub",
   "main": "snub-ws.js",
   "types": "index.d.ts",
+  "bin": {
+    "snub-ws-prune": "scripts/prune-uws.js"
+  },
   "scripts": {
     "test": "jest --runInBand --forceExit",
     "redis": "docker run --rm --name redis-snub -d -p 6379:6379 redis:4.0-alpine",
     "debug": "npx pm2 del all; npx pm2 start examples/websocket-server.js -i 4 && npx pm2 restart all && npx pm2 logs",
+    "prune-uws": "node scripts/prune-uws.js",
     "publish": "npm publish"
   },
   "repository": {
@@ -24,8 +28,12 @@
     "url": "https://github.com/cokeeffekt/snub-ws/issues"
   },
   "homepage": "https://github.com/cokeeffekt/snub-ws#readme",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.51.0"
+    "uws-legacy": "github:uNetworking/uWebSockets.js#v20.51.0",
+    "uws-modern": "github:uNetworking/uWebSockets.js#v20.69.0"
   },
   "devDependencies": {
     "ioredis-mock": "^8.13.1",

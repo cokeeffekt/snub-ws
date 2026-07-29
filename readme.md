@@ -12,6 +12,40 @@ Built on [uWebSockets.js](https://github.com/uNetworking/uWebSockets.js). Requir
 npm install snub snub-ws
 ```
 
+### Node support
+
+| Node | Supported |
+|---|---|
+| 18, 20 | ✅ (EOL — see below) |
+| 22 | ✅ recommended |
+| 23 | ✅ |
+| 24, 26 | ✅ |
+| 21, 25 | ❌ |
+
+uWebSockets.js ships prebuilt binaries tied to Node's ABI and cannot build from source, and no
+single release covers this whole range. snub-ws therefore installs two pinned builds
+(`uws-modern` v20.69.0 for Node 22/24/26, `uws-legacy` v20.51.0 for Node 18/20/22/23) and loads
+whichever matches the running Node. Nothing is required of you — but it does mean a large
+`node_modules`, see below.
+
+Node 18 and 20 are past end-of-life and `uws-legacy` is pinned to the last release supporting
+them, so it will receive no further upstream fixes. Support for them will be dropped in a future
+major; move to Node 22+ when you can.
+
+### Reclaiming disk space
+
+The two builds ship a binary for every platform/arch/ABI combination — about 218 MB, of which any
+one machine can load a single ~7 MB file. In a container build you can drop the binaries your
+platform can never use:
+
+```dockerfile
+RUN npm ci --omit=dev && npx snub-ws-prune
+```
+
+That leaves every ABI for the current platform and arch, so switching Node versions still works
+without reinstalling. Around 170 MB is freed. Skip it if the same `node_modules` is reused across
+operating systems or CPU architectures. Add `--dry-run` to preview.
+
 ---
 
 ## Quick start
@@ -62,6 +96,8 @@ SnubWS({
 
   // Restrict WebSocket upgrades to listed origins. null = allow all.
   // e.g. ['https://example.com', 'https://app.example.com']
+  // Also scopes CORS on the HTTP offload route: when set, only these origins
+  // may read offloaded message bodies; when null the route answers `*`.
   allowedOrigins: null,
 
   // Maximum simultaneous connections. 0 = unlimited.
