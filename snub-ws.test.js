@@ -91,6 +91,35 @@ const snubwsOffload = new SnubWS({
 });
 snub.use(snubwsOffload);
 
+// Dedicated servers for the S9 reserved-event-name tests. multiLogin is left on
+// so an "attacker" and a "victim" client can be connected at the same time.
+const snubwsSec = new SnubWS({
+  debug: false,
+  port: 9101,
+  multiLogin: true,
+  auth: auth,
+});
+snub.use(snubwsSec);
+
+// auth delegated to a bus event rather than a function, so the event name itself
+// has to be reserved.
+const snubwsSecAuthEvent = new SnubWS({
+  debug: false,
+  port: 9102,
+  multiLogin: true,
+  auth: 'sec-auth-check',
+});
+snub.use(snubwsSecAuthEvent);
+
+// debug on, so the drop diagnostics are actually emitted.
+const snubwsSecDebug = new SnubWS({
+  debug: true,
+  port: 9103,
+  multiLogin: true,
+  auth: auth,
+});
+snub.use(snubwsSecDebug);
+
 var snub2 = new Snub({
   host: 'localhost',
   password: '',
@@ -553,6 +582,340 @@ test('Messages sent from a second snub instance reach connected clients (M20)', 
 
   client.close();
 }, 5000);
+
+// --- S9: clients must not be able to address snub-ws' own control events ---
+//
+// Control events are registered as e.g. 'kick:*' but reserved by first segment
+// only ('kick'), while the inbound guard compared the whole event name.
+// 'kick:someone-else' therefore missed the reserved set and was re-emitted as
+// ws:kick:someone-else, straight into the control handler.
+
+test('Client cannot reach parameterised control events (S9)', async function () {
+  let victimId = null;
+  let attackerId = null;
+  let victimKicked = null;
+  let victimGotEvil = false;
+  let victimGotLegit = false;
+  let victimGotChannelEvil = false;
+  let victimGotChannelLegit = false;
+  const attackerReplies = [];
+
+  const victim = new Ws('ws://localhost:9101', {
+    onopen: () =>
+      victim.json(['_auth', { username: 'sec-victim', password: 'password' }]),
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') victimId = value._id;
+      if (key === '_kickConnection') victimKicked = value;
+      if (key === 'evil') victimGotEvil = true;
+      if (key === 'legit') victimGotLegit = true;
+      if (key === 'channel-evil') victimGotChannelEvil = true;
+      if (key === 'channel-legit') victimGotChannelLegit = true;
+    },
+  });
+
+  const attacker = new Ws('ws://localhost:9101', {
+    onopen: () =>
+      attacker.json([
+        '_auth',
+        { username: 'sec-attacker', password: 'password' },
+      ]),
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') attackerId = value._id;
+      if (key.startsWith('reply-')) attackerReplies.push([key, value]);
+    },
+  });
+
+  await waitFor(() => victimId !== null && attackerId !== null);
+
+  // Every one of these previously reached the control handler for sec-victim.
+  attacker.json(['get-clients:sec-victim', null, 'reply-1']);
+  attacker.json(['kick:sec-victim', 'pwned']);
+  attacker.json(['set-meta:sec-victim', { injected: true }]);
+  attacker.json(['send:sec-victim', ['evil', 'x']]);
+  attacker.json(['send-channel:sec-secret', ['evil', 'x']]);
+  attacker.json(['add-channel:sec-victim', ['sec-secret']]);
+  attacker.json(['set-channel:sec-victim', ['sec-secret']]);
+  attacker.json(['del-channel:sec-victim', ['sec-secret']]);
+  // ...and self-targeted, which is the worse of the two: subscribing yourself
+  // to a channel you were never granted.
+  attacker.json(['add-channel:sec-attacker', ['sec-secret']]);
+
+  await justWait(400);
+
+  // No state disclosure came back, and the victim is untouched.
+  expect(attackerReplies).toEqual([]);
+  expect(victimKicked).toBeNull();
+  expect(victimGotEvil).toBe(false);
+
+  // Nobody joined sec-secret, so a broadcast to it reaches neither client.
+  snub.poly('ws:send-channel:sec-secret', ['channel-evil', 1]).send();
+  await justWait(300);
+  expect(victimGotChannelEvil).toBe(false);
+
+  // The same control events still work when they come from the bus.
+  snub.poly('ws:send:sec-victim', ['legit', 1]).send();
+  snub.poly('ws:add-channel:sec-victim', ['sec-allowed']).send();
+  await justWait(300);
+  snub.poly('ws:send-channel:sec-allowed', ['channel-legit', 1]).send();
+
+  await waitFor(() => victimGotLegit && victimGotChannelLegit);
+  expect(victimGotLegit).toBe(true);
+  expect(victimGotChannelLegit).toBe(true);
+
+  victim.close();
+  attacker.close();
+}, 15000);
+
+test('Client cannot forge lifecycle or underscore-prefixed events (S9)', async function () {
+  // These are mono, so a competing listener would win the lottery half the time
+  // and make the counts below meaningless. Drop the earlier tests' handlers so
+  // these are the only ones registered.
+  snub.off('ws:client-updated');
+  snub.off('ws:client-disconnected');
+
+  const forged = [];
+  // A genuine lifecycle payload is the client state itself; a forged one is the
+  // inbound wrapper, so `from` is the tell.
+  const catchForgery = (name) => (payload) => {
+    if (payload && payload.from) forged.push(name);
+  };
+  snub.on('ws:client-authenticated.sectest', catchForgery('authenticated'));
+  snub.on('ws:client-disconnected.sectest', catchForgery('disconnected'));
+  snub.on('ws:client-updated.sectest', catchForgery('updated'));
+  snub.on('ws:client-failedauth.sectest', catchForgery('failedauth'));
+
+  let internalReached = 0;
+  snub.on('ws:_kickConnection.sectest', () => internalReached++);
+  snub.on('ws:_acceptAuth.sectest', () => internalReached++);
+
+  let clientId = null;
+  let pong = null;
+  const client = new Ws('ws://localhost:9101', {
+    onopen: () =>
+      client.json(['_auth', { username: 'sec-forger', password: 'password' }]),
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+      if (key === '_pong') pong = value;
+    },
+  });
+
+  await waitFor(() => clientId !== null);
+
+  client.json(['client-authenticated', { username: 'admin' }]);
+  client.json(['client-disconnected', { username: 'admin' }]);
+  client.json(['client-updated', { username: 'admin' }]);
+  client.json(['client-failedauth', { username: 'admin' }]);
+  client.json(['_kickConnection', 'nope']);
+  client.json(['_acceptAuth', { _id: 'nope' }]);
+
+  await justWait(400);
+
+  expect(forged).toEqual([]);
+  expect(internalReached).toBe(0);
+
+  // The underscore block must not have taken the keepalive with it.
+  client.json(['_ping', 12345]);
+  await waitFor(() => pong !== null);
+  expect(pong).toBe(12345);
+
+  client.close();
+  await justWait(200);
+
+  snub.off('ws:client-authenticated.sectest');
+  snub.off('ws:client-disconnected.sectest');
+  snub.off('ws:client-updated.sectest');
+  snub.off('ws:client-failedauth.sectest');
+  snub.off('ws:_kickConnection.sectest');
+  snub.off('ws:_acceptAuth.sectest');
+}, 10000);
+
+test('Unauthenticated clients cannot reach app handlers (S9)', async function () {
+  const received = [];
+  snub.on('ws:sec-app-event', (payload) => received.push(payload.payload));
+
+  let clientId = null;
+  const client = new Ws('ws://localhost:9101', {
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+    },
+  });
+
+  await justWait(300);
+  expect(clientId).toBeNull(); // no _auth sent yet
+
+  client.json(['sec-app-event', 'before-auth']);
+  await justWait(300);
+  expect(received).toEqual([]);
+
+  client.json(['_auth', { username: 'sec-late', password: 'password' }]);
+  await waitFor(() => clientId !== null);
+
+  client.json(['sec-app-event', 'after-auth']);
+  await waitFor(() => received.length > 0);
+  expect(received).toEqual(['after-auth']);
+
+  client.close();
+  snub.off('ws:sec-app-event');
+}, 10000);
+
+test('Non-string event names are ignored without killing the socket (S9)', async function () {
+  const received = [];
+  snub.on('ws:sec-shape-event', (payload) => received.push(payload.payload));
+
+  let clientId = null;
+  const client = new Ws('ws://localhost:9101', {
+    onopen: () =>
+      client.json(['_auth', { username: 'sec-shape', password: 'password' }]),
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+    },
+  });
+
+  await waitFor(() => clientId !== null);
+
+  // event.split() would throw uncaught inside the uWS callback without the guard
+  client.json([123, 'x']);
+  client.json([{ toString: 'nope' }, 'x']);
+  client.json([null, 'x']);
+  client.json([['nested'], 'x']);
+
+  await justWait(300);
+  expect(received).toEqual([]);
+
+  // The connection survived all of that.
+  client.json(['sec-shape-event', 'still-alive']);
+  await waitFor(() => received.length > 0);
+  expect(received).toEqual(['still-alive']);
+
+  client.close();
+  snub.off('ws:sec-shape-event');
+}, 10000);
+
+test('App events containing a colon are not over-blocked (S9)', async function () {
+  // The guard reserves first segments, so an app event whose first segment is
+  // not a control name must still get through with its segments intact.
+  const received = [];
+  snub.on('ws:sec-room:*', (payload, reply, channel) =>
+    received.push([channel.split(':').at(-1), payload.payload])
+  );
+
+  let clientId = null;
+  const client = new Ws('ws://localhost:9101', {
+    onopen: () =>
+      client.json(['_auth', { username: 'sec-rooms', password: 'password' }]),
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+    },
+  });
+
+  await waitFor(() => clientId !== null);
+
+  client.json(['sec-room:lobby', 'hello']);
+  await waitFor(() => received.length > 0);
+  expect(received).toEqual([['lobby', 'hello']]);
+
+  client.close();
+  snub.off('ws:sec-room:*');
+}, 10000);
+
+test('Configured auth event is not client-sendable (S9)', async function () {
+  let authCalls = 0;
+  snub.on('ws:sec-auth-check', (authObj, reply) => {
+    authCalls++;
+    reply(authObj.password === 'password' ? { token: 'sec-token' } : false);
+  });
+
+  let clientId = null;
+  const replies = [];
+  const client = new Ws('ws://localhost:9102', {
+    onopen: () =>
+      client.json(['_auth', { username: 'sec-authed', password: 'password' }]),
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') clientId = value._id;
+      if (key.startsWith('reply-')) replies.push([key, value]);
+    },
+  });
+
+  await waitFor(() => clientId !== null);
+  expect(authCalls).toBe(1);
+
+  // Calling the app's auth handler directly would be an oracle: arbitrary body,
+  // verdict returned on the replyId, none of #denyAuth's kick or timeout.
+  client.json([
+    'sec-auth-check',
+    { username: 'admin', password: 'guess' },
+    'reply-a',
+  ]);
+  client.json([
+    'sec-auth-check',
+    { username: 'admin', password: 'password' },
+    'reply-b',
+  ]);
+
+  await justWait(400);
+  expect(authCalls).toBe(1);
+  expect(replies).toEqual([]);
+
+  client.close();
+  snub.off('ws:sec-auth-check');
+}, 10000);
+
+test('Dropped inbound events are diagnosable under config.debug (S9)', async function () {
+  // A drop is silent on both sides, so without this an app that named one of
+  // its events after a control event has nothing to bisect against.
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+
+  try {
+    let clientId = null;
+    const client = new Ws('ws://localhost:9103', {
+      onmessage: (e) => {
+        const [key, value] = JSON.parse(e.data);
+        if (key === '_acceptAuth') clientId = value._id;
+      },
+    });
+
+    // Pre-auth first, while the connection is still unauthenticated.
+    await justWait(300);
+    client.json(['sec-debug-event', 1]);
+    await justWait(200);
+
+    client.json(['_auth', { username: 'sec-debug', password: 'password' }]);
+    await waitFor(() => clientId !== null);
+
+    client.json(['kick:someone-else', 'x']);
+    client.json(['_kickConnection', 'x']);
+    await justWait(300);
+
+    const dropped = warnings.filter((w) => w.includes('dropped inbound event'));
+    expect(dropped.length).toBe(3);
+    expect(
+      dropped.some(
+        (w) => w.includes('sec-debug-event') && w.includes('not authenticated')
+      )
+    ).toBe(true);
+    expect(
+      dropped.some(
+        (w) => w.includes('kick:someone-else') && w.includes('reserved control')
+      )
+    ).toBe(true);
+    expect(
+      dropped.some((w) => w.includes('_kickConnection') && w.includes('_ prefixed'))
+    ).toBe(true);
+
+    client.close();
+  } finally {
+    console.warn = realWarn;
+  }
+}, 10000);
 
 // helper functions
 

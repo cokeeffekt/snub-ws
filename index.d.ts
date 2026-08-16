@@ -54,7 +54,13 @@ export interface SnubWsConfig {
   /** Error handler. Default: no-op */
   error?: (err: unknown) => void;
 
-  /** Event names that clients are blocked from sending. Default: [] */
+  /**
+   * Additional event names clients are blocked from sending. Matched on the
+   * first `:`-separated segment, so `'admin'` also blocks `admin:anything`.
+   * snub-ws' own control events, the `client-*` lifecycle events, a string
+   * `auth` event and every `_`-prefixed name are reserved automatically.
+   * Default: []
+   */
   internalWsEvents?: string[];
 
   /** Max incoming message size in bytes. Default: 16777216 (16 MB) */

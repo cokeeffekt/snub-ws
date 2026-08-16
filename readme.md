@@ -121,7 +121,8 @@ SnubWS({
   // true = all events, or pass an array of specific event names.
   includeRaw: false,
 
-  // Additional event names that clients are blocked from sending
+  // Additional event names that clients are blocked from sending. Matched on
+  // the first ':' segment, so 'admin' also blocks 'admin:anything'.
   internalWsEvents: [],
 })
 ```
@@ -221,6 +222,15 @@ The server replies with `["my-reply-id", replyData]`, or `["my-reply-id:error", 
 | `_auth` | client | Authenticate with the server |
 | `_ping` | client | Ping the server — server responds with `_pong` |
 | `_pong` | client | Response to server-initiated `_ping` — ignored |
+
+Clients may only send the three events above from the `_` namespace; any other
+`_`-prefixed name is dropped rather than forwarded to the bus. Events sent before
+authentication completes are also dropped — only `_auth`, `_ping` and `_pong` are
+accepted on an unauthenticated socket. A client can never reach snub-ws' own
+control events (`send:…`, `kick:…`, `get-clients:…` and the rest); those names,
+the `client-*` lifecycle events and a string `auth` event are reserved on the
+first `:` segment. Turn on `debug` to log the reason whenever an inbound event is
+dropped.
 
 ### Built-in server events
 

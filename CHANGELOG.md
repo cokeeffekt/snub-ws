@@ -1,5 +1,77 @@
 # Changelog
 
+## 5.1.0 — 2026-08-17
+
+### Security
+
+**S9 — clients could address snub-ws' own control events.** Client messages are re-emitted onto
+the bus as `ws:<event>` with the client choosing `<event>`, and snub-ws' control events live in
+that same namespace. The reserved-name guard was the only separation between the two, and it
+compared the *whole* event name against a set populated with *first segments* —
+`registerWsSnubEvent('kick:*', …)` reserved `kick` but listened on `ws:kick:*`. `kick` was blocked;
+`kick:victim` was not.
+
+Every parameterised control event was therefore callable by any connected client:
+
+| client frame | effect |
+|---|---|
+| `["get-clients:victim", null, "r1"]` | the victim's full state returned to the caller's socket — username, id, channels, meta and `remoteAddress` — aggregated across every instance in the cluster. Comma lists (`get-clients:a,b,c`) made it a bulk enumeration primitive. |
+| `["kick:victim", "x"]` | any client could disconnect any other client, or a comma-separated list of them |
+| `["set-meta:victim", …]` | writes into another client's meta and fires a spurious `ws:client-updated` |
+| `["send:victim", […]]` | not exploitable, but only because `ws:send:*` array-destructures its payload and the inbound wrapper is not iterable. The same applied to `send-channel:*` and `add`/`del`/`set-channel:*`. |
+
+Three further holes in the same class:
+
+- **Inbound events were not gated on authentication.** `onMessage` never checked
+  `authenticated` — only outbound `send()` did — so the side-effecting events above worked from an
+  unauthenticated socket inside the `authTimeout` window, and every app-level `snub.on('ws:…')`
+  handler was reachable pre-auth.
+- **A string `auth` event was client-sendable.** With `auth: '<event>'`, `#validateAuth` emits
+  `ws:<event>` directly rather than through `registerWsSnubEvent`, so it was never reserved. A
+  client could invoke the app's auth handler with an arbitrary body and read the verdict off a
+  `replyId`, bypassing the deny path, the kick and the auth timeout entirely — a credential and
+  username oracle.
+- **Lifecycle events were forgeable.** `client-authenticated`, `client-disconnected`,
+  `client-updated` and `client-failedauth` are emitted by snub-ws but not registered through the
+  helper, so a client could publish them onto the bus and drive app handlers that assume they came
+  from the server.
+
+Fixed by making the reserved set uniformly first-segment, reserving the lifecycle events and the
+configured auth event, rejecting `_`-prefixed and non-string event names, and gating the emit on
+`authenticated`.
+
+### Behaviour changes
+
+- **Client messages sent before authentication completes are now dropped** rather than forwarded to
+  the bus with `from.authenticated === false`. With `auth: false` clients are authenticated in the
+  constructor, so this only affects the in-flight window of `auth` as a string or function. This is
+  the change most likely to surprise: an app that acted on pre-auth events will simply stop seeing
+  them.
+- **`_`-prefixed events from clients no longer reach the bus.** `_auth`, `_ping` and `_pong` are
+  handled as before; anything else beginning with `_` is dropped instead of being emitted as
+  `ws:_<name>`.
+- **Non-string event names are ignored** instead of being coerced (`['ws:' + 123]`).
+- **`internalWsEvents` entries are normalised to their first segment.** An entry of `'foo:bar'` now
+  reserves all of `foo:*`, not just the exact name — previously an entry containing a colon could
+  never match at all.
+
+### Diagnostics
+
+- A dropped inbound event now logs a reason under `config.debug`. A dropped event is otherwise
+  invisible from both ends — the client gets no error and the bus never sees it — which makes it
+  the hardest kind of upgrade break to diagnose.
+
+### Tests
+
+- Six cases in `snub-ws.test.js` (tagged `S9`) covering reserved control events, forged lifecycle
+  and `_` frames, pre-auth reachability, non-string event names, the configured auth event, and a
+  guard that app events containing a colon are not over-blocked
+- `snub-smoke/scenarios/ws/34-ws-event-namespace.js` — 10 checks against a live Redis and forked
+  snub-ws instances. The `send:*` and channel checks assert that *nothing was delivered* rather
+  than that something threw: those paths are currently protected only by the payload wrapper being
+  non-iterable, so unwrapping it in a future refactor would silently re-arm client-to-client
+  message spoofing.
+
 ## 5.0.0 — 2026-07-29
 
 ### Node version support

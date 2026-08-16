@@ -69,11 +69,35 @@ module.exports = function (config) {
     snub = snubInstance; // hoist snub instance
     config.instanceId += '_' + snub.generateUID();
 
-    // create a set of internal events to prevent socket clients from sending them
+    // Create a set of internal events to prevent socket clients from sending
+    // them. Everything in here is a *first segment*: a control event is
+    // addressed as `<name>:<targets>`, so reserving the name reserves every
+    // target. User-supplied entries are normalised the same way, otherwise an
+    // entry like 'my-event:sub' would never match the first-segment lookup in
+    // WsClient.onMessage.
     config.internalWsEvents = config.internalWsEvents.map((eventName) => {
-      return eventName.replace(/^ws:/, ''); // ensure no ws: prefix
+      return eventName.replace(/^ws:/, '').split(':')[0]; // ensure no ws: prefix
     });
     config.internalWsEvents = new Set(config.internalWsEvents);
+
+    // Lifecycle events snub-ws emits *about* a client. They never originate
+    // from a client, so a client must not be able to forge one.
+    for (const eventName of [
+      'client-authenticated',
+      'client-disconnected',
+      'client-updated',
+      'client-failedauth',
+    ])
+      config.internalWsEvents.add(eventName);
+
+    // When auth is delegated to a bus event, #validateAuth emits it directly
+    // rather than through registerWsSnubEvent, so it needs reserving too --
+    // otherwise a client can invoke the app's auth handler with an arbitrary
+    // body and read the verdict back off a replyId, bypassing #denyAuth and
+    // the kick path entirely.
+    if (typeof config.auth === 'string')
+      config.internalWsEvents.add(config.auth.replace(/^ws:/, '').split(':')[0]);
+
     function registerWsSnubEvent(eventName, handler) {
       config.internalWsEvents.add(eventName.split(':')[0]);
       snub.on('ws:' + eventName, (payload, reply, channel) => {
@@ -649,6 +673,18 @@ class WsClient {
     };
   }
 
+  // An inbound event that never reaches the bus is silent on both sides, which
+  // makes it the hardest kind of upgrade break to diagnose. Costs nothing when
+  // debug is off.
+  #debugDrop(event, why) {
+    if (!this.#config.debug) return;
+    console.warn(
+      `Snub-Ws: dropped inbound event "${event}" from ${
+        this.#internal.auth?.username || this.#internal.id
+      } — ${why}`
+    );
+  }
+
   onMessage(message) {
     let stringMessage;
     try {
@@ -659,16 +695,30 @@ class WsClient {
     }
     if (!Array.isArray(message)) return;
     const [event, payload, reply] = message;
+    // Everything below assumes a string; event.split() would throw uncaught
+    // inside the uWS message callback, as the try/catch here only wraps the emit.
+    if (typeof event !== 'string') return;
 
     this.#internal.lastMsgTime = Date.now();
 
-    if (this.#config.internalWsEvents.has(event)) return; // block internal events
+    // Compare the first segment, not the whole name: control events are
+    // registered as e.g. 'kick:*' but reserved as 'kick', so an exact-match
+    // lookup let 'kick:someone-else' through to the control handler.
+    if (this.#config.internalWsEvents.has(event.split(':')[0])) {
+      // Dropped events are otherwise invisible from both ends -- the client
+      // gets no error and the bus never sees the event -- so an app that named
+      // one of its own events after a control event has nothing to go on.
+      this.#debugDrop(event, 'it is a reserved control event');
+      return;
+    }
 
     if (event === '_auth') return this.#validateAuth(payload);
     if (event === '_ping') return this.send('_pong', payload);
     if (event === '_pong') return;
-
-    //@todo prevent client from sending internal events
+    if (event.startsWith('_')) {
+      this.#debugDrop(event, '_ prefixed events are reserved for the protocol');
+      return;
+    }
 
     if (this.#config.throttle) {
       const oldest = this.#internal.recent[this.#internal.recentIdx];
@@ -678,6 +728,14 @@ class WsClient {
       this.#internal.recent[this.#internal.recentIdx] = Date.now();
       this.#internal.recentIdx =
         (this.#internal.recentIdx + 1) % this.#config.throttle[0];
+    }
+
+    // App handlers all assume `from` is a real, authenticated client. Gated
+    // after the throttle so an unauthenticated flood still trips THROTTLE_LIMIT
+    // and gets kicked, rather than being dropped for free until authTimeout.
+    if (!this.#internal.authenticated) {
+      this.#debugDrop(event, 'the client has not authenticated yet');
+      return;
     }
 
     const includeRaw =
