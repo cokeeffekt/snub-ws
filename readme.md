@@ -372,7 +372,7 @@ Automatic kick reasons:
 | `IDLE_TIMEOUT` | No messages received within `idleTimeout` ms |
 | `THROTTLE_LIMIT` | Client exceeded the rate limit |
 | `QUEUE_OVERFLOW` | Outbound queue exceeded `maxQueueSize` |
-| `SERVER_SHUTDOWN` | Server received SIGINT / SIGTERM / SIGUSR2 |
+| `SERVER_SHUTDOWN` | `close()` was called, or the server received SIGINT / SIGTERM / SIGUSR2 with `handleSignals: true` |
 
 ---
 
