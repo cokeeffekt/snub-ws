@@ -49,9 +49,13 @@ const DEFAULT_CONFIG = {
   maxQueueSize: 100, // max messages to queue when client is under backpressure before kicking
   maxBackpressure: 1 * 1024 * 1024, // memory limit for backpressure
   offloadToHttpSize: 0.5 * 1024 * 1024, // if message is larger than this, offload to http
+  heartbeatInterval: 5 * 1000, // ms between registry heartbeats
+  instanceTtl: 15 * 1000, // ms without a heartbeat before an instance is considered gone
+  handleSignals: true, // install SIGINT/SIGTERM/SIGUSR2 handlers that close() then exit
 };
 
 let snub;
+let warnedNoPrefix = false;
 module.exports = function (config) {
   config = {
     ...DEFAULT_CONFIG,
@@ -62,10 +66,16 @@ module.exports = function (config) {
 
   config.offloadToHttpSize =
     config.offloadToHttpSize < 1 ? null : config.offloadToHttpSize;
+  // An instance must survive at least two missed beats before it is swept.
+  config.heartbeatInterval = Math.max(100, config.heartbeatInterval);
+  config.instanceTtl = Math.max(
+    config.instanceTtl,
+    config.heartbeatInterval * 2
+  );
 
   if (config.debug) console.log('Snub-ws Init', config);
 
-  return function (snubInstance) {
+  const middleware = function (snubInstance) {
     snub = snubInstance; // hoist snub instance
     config.instanceId += '_' + snub.generateUID();
 
@@ -96,7 +106,9 @@ module.exports = function (config) {
     // body and read the verdict back off a replyId, bypassing #denyAuth and
     // the kick path entirely.
     if (typeof config.auth === 'string')
-      config.internalWsEvents.add(config.auth.replace(/^ws:/, '').split(':')[0]);
+      config.internalWsEvents.add(
+        config.auth.replace(/^ws:/, '').split(':')[0]
+      );
 
     function registerWsSnubEvent(eventName, handler) {
       config.internalWsEvents.add(eventName.split(':')[0]);
@@ -107,14 +119,167 @@ module.exports = function (config) {
       });
     }
 
-    // New stuff
-    const wsClients = new WsClients(config);
+    // --- redis keys ---------------------------------------------------------
+    // Everything snub-ws writes lives under the snub prefix, so two deployments
+    // sharing one redis db never see each other's instances or clients.
+    if (typeof snub.prefix !== 'string' && !warnedNoPrefix) {
+      warnedNoPrefix = true;
+      console.warn(
+        'Snub-Ws: this snub does not expose `prefix` (needs snub >= 5.1.0); assuming "snub:" for registry keys'
+      );
+    }
+    const prefix = typeof snub.prefix === 'string' ? snub.prefix : 'snub:';
+    const keys = {
+      registry: prefix + '_snubws_instance',
+      clients: (instanceId) => prefix + '_snubws_clients:' + instanceId,
+      login: (username) => prefix + '_snubws_login:' + username,
+      offload: (id) => prefix + '_snubws_offload:' + id,
+    };
+    const ownClientsKey = keys.clients(config.instanceId);
+    let closed = false;
 
-    // ten second interval to keep instance alive
-    instanceAlive();
-    setInterval(() => {
-      instanceAlive();
+    // Liveness is decided by redis' own clock: scores are redis TIME in ms and
+    // the sweep threshold is redis TIME minus the ttl, both inside one script.
+    // Host clock skew can therefore neither evict a healthy instance nor keep a
+    // dead one, and the read + sweep pair is atomic. Every key carries a TTL so
+    // a cluster that dies outright leaves nothing behind.
+    const HEARTBEAT_LUA = `
+      local t = redis.call('TIME')
+      local now = t[1] * 1000 + math.floor(t[2] / 1000)
+      local ttl = tonumber(ARGV[2])
+      redis.call('ZADD', KEYS[1], string.format('%.0f', now), ARGV[1])
+      redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%.0f', now - ttl))
+      redis.call('PEXPIRE', KEYS[1], ttl * 2)
+      for i = 2, #KEYS do redis.call('PEXPIRE', KEYS[i], ttl) end
+      return string.format('%.0f', now)`;
+    const ALIVE_LUA = `
+      local t = redis.call('TIME')
+      local now = t[1] * 1000 + math.floor(t[2] / 1000)
+      redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%.0f', now - tonumber(ARGV[1])))
+      return redis.call('ZRANGE', KEYS[1], 0, -1)`;
+    // Single login as compare-and-set: the claimant learns who held the
+    // username before it, and the holder only releases a key it still owns.
+    const CLAIM_LOGIN_LUA = `
+      local prev = redis.call('GET', KEYS[1])
+      redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+      return prev`;
+    const RELEASE_LOGIN_LUA = `
+      if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+      return 0`;
 
+    // Each instance mirrors its authenticated clients into a hash so cluster
+    // queries are a read, not a fan-out. Structural changes (auth, meta,
+    // channels) are written immediately; lastMsgTime moves on every inbound
+    // frame and is flushed by the heartbeat instead.
+    const store = {
+      offloadKey: keys.offload,
+      persist(client) {
+        if (closed || !client.state.authenticated) return;
+        client.dirty = false;
+        return snub.redis
+          .pipeline([
+            [
+              'hset',
+              ownClientsKey,
+              client.state.id,
+              snub.stringifyJson(client.state),
+            ],
+            ['pexpire', ownClientsKey, config.instanceTtl],
+          ])
+          .exec()
+          .catch((error) =>
+            console.error('Snub-Ws: Redis error persisting client state', error)
+          );
+      },
+      remove(client) {
+        return snub.redis
+          .hdel(ownClientsKey, client.state.id)
+          .catch((error) =>
+            console.error('Snub-Ws: Redis error removing client state', error)
+          );
+      },
+      claimLogin(client) {
+        return snub.redis.eval(
+          CLAIM_LOGIN_LUA,
+          1,
+          keys.login(client.state.username),
+          client.state.id,
+          config.instanceTtl
+        );
+      },
+      releaseLogin(client) {
+        return snub.redis
+          .eval(
+            RELEASE_LOGIN_LUA,
+            1,
+            keys.login(client.state.username),
+            client.state.id
+          )
+          .catch((error) =>
+            console.error('Snub-Ws: Redis error releasing single login', error)
+          );
+      },
+    };
+
+    const wsClients = new WsClients(config, store);
+
+    // --- instance registry ---------------------------------------------------
+    async function heartbeat() {
+      if (closed) return;
+      try {
+        const expireKeys = [ownClientsKey];
+        const dirty = [];
+        for (const client of wsClients.clients().values()) {
+          if (!client.state.authenticated) continue;
+          if (!config.multiLogin && client.state.username)
+            expireKeys.push(keys.login(client.state.username));
+          if (client.dirty) {
+            client.dirty = false;
+            dirty.push([
+              'hset',
+              ownClientsKey,
+              client.state.id,
+              snub.stringifyJson(client.state),
+            ]);
+          }
+        }
+        if (dirty.length) {
+          const results = await snub.redis.pipeline(dirty).exec();
+          const failed = results.find(([err]) => err);
+          if (failed) throw failed[0];
+        }
+        await snub.redis.eval(
+          HEARTBEAT_LUA,
+          1 + expireKeys.length,
+          keys.registry,
+          ...expireKeys,
+          config.instanceId,
+          config.instanceTtl
+        );
+      } catch (error) {
+        console.error('Snub-Ws: Redis error in heartbeat', error);
+      }
+    }
+
+    async function aliveInstances() {
+      try {
+        return await snub.redis.eval(
+          ALIVE_LUA,
+          1,
+          keys.registry,
+          config.instanceTtl
+        );
+      } catch (error) {
+        console.error('Snub-Ws: Redis error in aliveInstances', error);
+        return [];
+      }
+    }
+
+    heartbeat();
+    const heartbeatTimer = setInterval(heartbeat, config.heartbeatInterval);
+    heartbeatTimer.unref();
+
+    const idleTimer = setInterval(() => {
       wsClients.clients().forEach((client) => {
         // send ping to connection that will soon idle out
         const idleOutTime = client.state.lastMsgTime + config.idleTimeout;
@@ -127,41 +292,56 @@ module.exports = function (config) {
         }
       });
     }, 1000 * 10);
+    idleTimer.unref();
 
-    function instanceAlive() {
-      snub.redis.zadd(
-        '_snubws_instance',
-        Date.now() + 30 * 1000,
-        config.instanceId
-      );
-    }
-
-    async function aliveInstances() {
+    // Stop listening, drain the clients, then deregister. Safe to call more
+    // than once. Leaves the snub instance alone -- that belongs to the app.
+    let listenSocket = null;
+    async function close() {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeatTimer);
+      clearInterval(idleTimer);
+      if (config.handleSignals)
+        for (const signal of SIGNALS) process.off(signal, onSignal);
+      // Release the port first so a balancer stops sending new connections
+      // here while the existing ones are told to leave.
+      if (listenSocket) {
+        uWS.us_listen_socket_close(listenSocket);
+        listenSocket = null;
+      }
+      const clients = wsClients.clients();
+      clients.forEach((client) => client.kick('SERVER_SHUTDOWN'));
+      await justWait(500);
       try {
-        const now = Date.now();
-        const instances = await snub.redis.zrangebyscore(
-          '_snubws_instance',
-          now,
-          '+inf'
-        );
-        await snub.redis.zremrangebyscore('_snubws_instance', '-inf', now);
-        return instances;
+        const ops = [
+          snub.redis.zrem(keys.registry, config.instanceId),
+          snub.redis.del(ownClientsKey),
+        ];
+        if (!config.multiLogin)
+          for (const client of clients.values())
+            if (client.state.username)
+              ops.push(
+                snub.redis.eval(
+                  RELEASE_LOGIN_LUA,
+                  1,
+                  keys.login(client.state.username),
+                  client.state.id
+                )
+              );
+        await Promise.all(ops);
       } catch (error) {
-        console.error('Snub-Ws: Redis error in aliveInstances', error);
-        return [];
+        console.error('Snub-Ws: Redis error during close', error);
       }
     }
 
-    async function shutdown() {
-      wsClients.clients().forEach((client) => client.kick('SERVER_SHUTDOWN'));
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      await snub.redis.zrem('_snubws_instance', config.instanceId);
+    const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGUSR2'];
+    async function onSignal() {
+      await close();
       process.exit(0);
     }
-
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
-    process.on('SIGUSR2', shutdown);
+    if (config.handleSignals)
+      for (const signal of SIGNALS) process.on(signal, onSignal);
 
     // A browser always fetches offload bodies cross-origin: the client derives
     // the URL from the ws url, and an origin includes the port, so a page on
@@ -233,7 +413,7 @@ module.exports = function (config) {
         if (params.offload) {
           const offloadId = params.offload;
           snub.redis
-            .get('_snubws_offload:' + offloadId)
+            .get(keys.offload(offloadId))
             .then((offloadData) => {
               if (res.aborted) return;
               if (offloadData) {
@@ -278,7 +458,9 @@ module.exports = function (config) {
             config.maxConnections > 0 &&
             wsClients.count >= config.maxConnections
           ) {
-            res.writeStatus('503 Service Unavailable').end('Too many connections');
+            res
+              .writeStatus('503 Service Unavailable')
+              .end('Too many connections');
             return;
           }
 
@@ -341,6 +523,7 @@ module.exports = function (config) {
       })
       .listen(config.port, (token) => {
         if (token) {
+          listenSocket = token;
           console.log(
             `Snub WS server listening ${config.instanceId} on port ${config.port}, MultiLogin: ${config.multiLogin}`
           );
@@ -428,28 +611,65 @@ module.exports = function (config) {
       clients.kick(payload);
     });
 
+    // --- cluster-wide client state ------------------------------------------
+    // Our own clients come from memory (fresher); every other live instance's
+    // from the hash it maintains. No reply counting, no waiting on a quiet
+    // period, and a dead instance's clients vanish with its hash.
+    async function clusterClients() {
+      const instances = await aliveInstances();
+      const clients = wsClients
+        .clients()
+        .states.filter((state) => state.authenticated);
+      const others = instances.filter((id) => id !== config.instanceId);
+      if (others.length) {
+        try {
+          const results = await snub.redis
+            .pipeline(others.map((id) => ['hvals', keys.clients(id)]))
+            .exec();
+          results.forEach(([err, values], i) => {
+            if (err)
+              return console.error(
+                'Snub-Ws: could not read clients of instance ' + others[i],
+                err
+              );
+            for (const raw of values) {
+              try {
+                clients.push(snub.parseJson(raw));
+              } catch (error) {
+                console.error(
+                  'Snub-Ws: bad client record from instance ' + others[i],
+                  error
+                );
+              }
+            }
+          });
+        } catch (error) {
+          console.error('Snub-Ws: Redis error reading cluster clients', error);
+        }
+      }
+      return { clients, instances };
+    }
+
+    const byIdOrUsername = (idsOrUsernames) => {
+      const list = normalizeStringArray(idsOrUsernames);
+      return (state) =>
+        list === undefined ||
+        list.includes(state.id) ||
+        list.includes(state.username);
+    };
+    const byChannel = (channels) => {
+      const list = normalizeStringArray(channels) || [];
+      return (state) =>
+        list.some((channel) => state.channels.includes(channel));
+    };
+
     async function getAllConnectedClientStates(idsOrUsernames) {
       try {
-        var instances = await aliveInstances();
-        const instancesClients = await snub
-          .poly('ws_internal:connected-clients', idsOrUsernames)
-          .awaitReply(1000, instances.length);
-
-        if (instancesClients.length < instances.length)
-          console.warn(
-            'Snub-Ws: Not all instances replied to ws_internal:connected-clients',
-            instancesClients.length,
-            instances.length
-          );
-        const clients = [];
-        instancesClients.forEach((instance) => {
-          clients.push(...instance[1]);
-        });
-        return clients;
-      }
-      catch (err) {
-        console.error(err)
-        return []
+        const { clients } = await clusterClients();
+        return clients.filter(byIdOrUsername(idsOrUsernames));
+      } catch (err) {
+        console.error(err);
+        return [];
       }
     }
 
@@ -467,46 +687,53 @@ module.exports = function (config) {
 
     registerWsSnubEvent('channel-clients', async (channels, reply) => {
       try {
-        var instances = await aliveInstances();
-        const instancesClients = await snub
-          .poly('ws_internal:channel-clients', channels)
-          .awaitReply(1000, instances.length);
-        const clients = [];
-        instancesClients.forEach((instance) => {
-          clients.push(...instance[1]);
-        });
-        reply(clients);
-      }
-      catch (err) {
-        console.error(err)
-        reply([])
+        const { clients } = await clusterClients();
+        reply(clients.filter(byChannel(channels)));
+      } catch (err) {
+        console.error(err);
+        reply([]);
       }
     });
 
-    snub.on('ws_internal:dedupe-client-check', async (state) => {
-      if (config.multiLogin) return;
-      const clients = wsClients.clients(state.username);
-      clients.forEach((client) => {
-        if (
-          client.state.id !== state.id &&
-          client.state.connectTime <= state.connectTime
-        ) {
-          if (client.state.connectTime === state.connectTime)
-            if (client.state.id > state.id) return;
-          client.kick('DUPE_LOGIN', 3000);
-        }
-      });
+    // The honest form of the queries above: says which instances were alive
+    // when the answer was assembled, so a caller can tell "offline" from
+    // "an instance is missing". Optional filter: { ids, channels }.
+    registerWsSnubEvent('cluster-clients', async (filter, reply) => {
+      try {
+        const { clients, instances } = await clusterClients();
+        let out = clients;
+        if (filter && filter.ids !== undefined)
+          out = out.filter(byIdOrUsername(filter.ids));
+        if (filter && filter.channels !== undefined)
+          out = out.filter(byChannel(filter.channels));
+        reply({ clients: out, instances });
+      } catch (err) {
+        console.error(err);
+        reply({ clients: [], instances: [] });
+      }
     });
 
-    snub.on('ws_internal:connected-clients', function (idsOrUsernames, reply) {
-      // if(Math.random() > .5) return;
-      reply([config.instanceId, wsClients.clients(idsOrUsernames).states]);
-    });
-
-    snub.on('ws_internal:channel-clients', function (channels, reply) {
-      reply([config.instanceId, wsClients.channelClients(channels).states]);
-    });
+    const handle = {
+      close,
+      get instanceId() {
+        return config.instanceId;
+      },
+      get port() {
+        return config.port;
+      },
+      get closed() {
+        return closed;
+      },
+    };
+    middleware.close = close;
+    return handle;
   };
+
+  middleware.close = () =>
+    Promise.reject(
+      new Error('snub-ws: not registered yet -- pass it to snub.use() first')
+    );
+  return middleware;
 };
 
 function hashString(str) {
@@ -568,10 +795,12 @@ class ClientMap extends Map {
 class WsClients {
   #config;
   #clients;
+  #store;
 
-  constructor(config) {
+  constructor(config, store) {
     this.#config = config;
     this.#clients = new Map();
+    this.#store = store;
   }
 
   get count() {
@@ -603,7 +832,7 @@ class WsClients {
   }
 
   createClient(ws) {
-    const client = new WsClient(ws, this.#config, this.#clients);
+    const client = new WsClient(ws, this.#config, this.#clients, this.#store);
     return client;
   }
 }
@@ -612,6 +841,8 @@ class WsClient {
   #ws;
   #config;
   #clients;
+  #store;
+  #dirty = false;
   #internal = {
     id: null,
     connectTime: Date.now(),
@@ -630,10 +861,11 @@ class WsClient {
   #authTimeout;
   #messageQueue = [];
 
-  constructor(ws, config, clients) {
+  constructor(ws, config, clients, store) {
     this.#ws = ws;
     this.#config = config;
     this.#clients = clients;
+    this.#store = store;
 
     this.#internal.id =
       config.instanceId +
@@ -673,6 +905,15 @@ class WsClient {
     };
   }
 
+  // Set when state changed in a way that is not worth a redis write of its
+  // own (lastMsgTime); the heartbeat flushes it.
+  get dirty() {
+    return this.#dirty;
+  }
+  set dirty(value) {
+    this.#dirty = value;
+  }
+
   // An inbound event that never reaches the bus is silent on both sides, which
   // makes it the hardest kind of upgrade break to diagnose. Costs nothing when
   // debug is off.
@@ -700,6 +941,7 @@ class WsClient {
     if (typeof event !== 'string') return;
 
     this.#internal.lastMsgTime = Date.now();
+    this.#dirty = true;
 
     // Compare the first segment, not the whole name: control events are
     // registered as e.g. 'kick:*' but reserved as 'kick', so an exact-match
@@ -754,8 +996,8 @@ class WsClient {
         .replyAt(
           reply
             ? (data) => {
-              this.send(reply, data);
-            }
+                this.send(reply, data);
+              }
             : undefined
         )
         .send((c) => {
@@ -789,6 +1031,11 @@ class WsClient {
     clearTimeout(this.#authTimeout);
     message = Buffer.from(message).toString();
     this.#clients.delete(this.#internal.id);
+    if (this.#internal.authenticated) {
+      this.#store.remove(this);
+      if (!this.#config.multiLogin && this.state.username)
+        this.#store.releaseLogin(this);
+    }
     snub.mono('ws:client-disconnected', this.state).send();
   }
 
@@ -813,10 +1060,15 @@ class WsClient {
       this.#config.offloadToHttpSize &&
       Buffer.byteLength(sendString, 'utf8') > this.#config.offloadToHttpSize
     ) {
-      if(this.#config.debug)
-        console.log('Snub-Ws: Offloading to HTTP', event, Buffer.byteLength(sendString, 'utf8'), sendString.length);
+      if (this.#config.debug)
+        console.log(
+          'Snub-Ws: Offloading to HTTP',
+          event,
+          Buffer.byteLength(sendString, 'utf8'),
+          sendString.length
+        );
       const offloadId = randomBytes(16).toString('hex');
-      snub.redis.set('_snubws_offload:' + offloadId, sendString, 'EX', 30);
+      snub.redis.set(this.#store.offloadKey(offloadId), sendString, 'EX', 30);
       this.#ws.send(snub.stringifyJson(['_offload', offloadId]));
       return;
     }
@@ -867,6 +1119,7 @@ class WsClient {
       }
     });
     this.#internal.metaObj = newMeta;
+    this.#store.persist(this);
     snub.mono('ws:client-updated', this.state).send();
   }
 
@@ -877,6 +1130,7 @@ class WsClient {
       ...this.#internal.channels,
       ...arrayOfChannels,
     ]);
+    this.#store.persist(this);
   }
 
   delChannel(arrayOfChannels) {
@@ -885,12 +1139,14 @@ class WsClient {
     arrayOfChannels.forEach((channel) => {
       this.#internal.channels.delete(channel);
     });
+    this.#store.persist(this);
   }
 
   setChannel(arrayOfChannels) {
     if (typeof arrayOfChannels === 'string')
       arrayOfChannels = [arrayOfChannels];
     this.#internal.channels = new Set(arrayOfChannels);
+    this.#store.persist(this);
   }
 
   kick(reason, code = 1000) {
@@ -950,21 +1206,33 @@ class WsClient {
     }
   }
 
-  #acceptAuth(authPayload, validAuthOrObj = {}) {
+  async #acceptAuth(authPayload, validAuthOrObj = {}) {
     this.#internal.authenticated = true;
     this.#internal.auth = authPayload;
-    if (!this.#config.multiLogin && this.state.username)
-      snub.poly('ws_internal:dedupe-client-check', this.state).send();
 
-    setTimeout(
-      () => {
-        if (this.state.authenticated) {
-          this.send('_acceptAuth', { _id: this.state.id, ...validAuthOrObj });
-          snub.mono('ws:client-authenticated', this.state).send();
-        }
-      },
-      this.#config.multiLogin ? 0 : 100
-    );
+    if (!this.#config.multiLogin && this.state.username) {
+      // Claim the username. Whoever held it before -- on this instance or any
+      // other -- is kicked by id, and the claim itself is what orders two
+      // near-simultaneous logins, not a comparison of host clocks.
+      try {
+        const previous = await this.#store.claimLogin(this);
+        if (previous && previous !== this.state.id)
+          snub.poly('ws:kick', [previous, 'DUPE_LOGIN', 3000]).send();
+      } catch (error) {
+        console.error(
+          'Snub-Ws: Redis error claiming single login; allowing the login',
+          error
+        );
+      }
+    } else {
+      await justWait(0);
+    }
+
+    // Kicked or closed while the claim was in flight.
+    if (!this.state.authenticated || this.#internal.closing) return;
+    this.send('_acceptAuth', { _id: this.state.id, ...validAuthOrObj });
+    this.#store.persist(this);
+    snub.mono('ws:client-authenticated', this.state).send();
   }
 
   #denyAuth() {

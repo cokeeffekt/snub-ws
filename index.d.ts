@@ -80,6 +80,46 @@ export interface SnubWsConfig {
 
   /** uWS compression setting. Default: uWS.SHARED_COMPRESSOR */
   compression?: string;
+
+  /** Ms between registry heartbeats. Default: 5000 */
+  heartbeatInterval?: number;
+
+  /**
+   * Ms without a heartbeat before an instance is considered gone (judged on
+   * Redis' clock). Clamped to at least 2 × heartbeatInterval. Default: 15000
+   */
+  instanceTtl?: number;
+
+  /**
+   * Install SIGINT/SIGTERM/SIGUSR2 handlers that call close() and then
+   * process.exit(0). Default: true
+   */
+  handleSignals?: boolean;
+}
+
+/** Returned by `snub.use(SnubWs(config))` (snub >= 5.1.0). */
+export interface SnubWsHandle {
+  /**
+   * Stop listening, kick every client with SERVER_SHUTDOWN, drain for 500 ms,
+   * then remove this instance from Redis. Idempotent.
+   */
+  close(): Promise<void>;
+  readonly instanceId: string;
+  readonly port: number;
+  readonly closed: boolean;
+}
+
+/** Reply shape of the `ws:cluster-clients` query. */
+export interface ClusterClientsReply {
+  clients: ClientState[];
+  /** Ids of every instance alive when the answer was assembled. */
+  instances: string[];
+}
+
+export interface SnubWsMiddleware {
+  (snubInstance: unknown): SnubWsHandle;
+  /** Same as the handle's close(); rejects if the middleware was never registered. */
+  close(): Promise<void>;
 }
 
 export type AuthCallback = (validAuthOrObj: true | false | Record<string, unknown>, err?: unknown) => void;
@@ -110,6 +150,6 @@ export interface ClientState {
  * const snub = new Snub();
  * snub.use(SnubWs({ port: 8585, auth: false }));
  */
-declare function SnubWs(config?: SnubWsConfig): (snubInstance: unknown) => void;
+declare function SnubWs(config?: SnubWsConfig): SnubWsMiddleware;
 
 export = SnubWs;

@@ -1,5 +1,47 @@
 # Changelog
 
+## 5.2.0 — 2026-09-23
+
+### Instance tracking rewritten
+
+Instances need each other for three things: answering "who is connected" across
+the cluster, enforcing `multiLogin: false`, and cleaning up after one dies. All
+three went through a registry scored on each host's wall clock and a
+count-the-replies fan-out. Reviewed against a real multi-host deployment that
+had the following problems, all fixed here:
+
+| was | now |
+|---|---|
+| Registry scores were the writer's `Date.now()`, compared against the reader's. A host 30 s behind was swept by everyone else and never counted. | Scores and the sweep threshold both come from Redis `TIME`, inside one Lua script. Host clocks are irrelevant and the read + sweep is atomic. |
+| `multiLogin: false` compared `connectTime` across hosts, so a newer login on a slow-clock host looked older and **both sessions survived**. The dedupe broadcast also had no acknowledgement and a 100 ms race. | An accepted login atomically claims `<prefix>_snubws_login:<username>` and learns the previous holder, which is kicked by id wherever it is. Two simultaneous logins on different instances leave exactly one. |
+| Queries did `poly(...).awaitReply(1000, instances.length)`: a dead instance made every query wait the full second for up to 30 s, and a short answer was returned as if complete with only a `console.warn`. | Each instance mirrors its authenticated clients into `<prefix>_snubws_clients:<instanceId>` (refreshed and expiring with the heartbeat). Queries are a Redis read: no reply window, no partial answers, and a crashed instance's clients drop out within `instanceTtl`. |
+| `_snubws_instance` and `_snubws_offload:*` were written **unprefixed**, so deployments sharing a Redis db inflated each other's instance counts. | Every key lives under the snub `prefix`. |
+| Only a signal removed an instance; a SIGKILL/OOM left it registered for 30 s. The heartbeat `zadd` had no error handler. | Heartbeat every `heartbeatInterval` (5 s), swept after `instanceTtl` (15 s), both configurable; every key carries a TTL; errors are logged. |
+| No way to shut down: the signal handler called `process.exit(0)` itself and the uWS listen socket was never exposed. | `close()` — on the handle `snub.use()` returns (snub ≥ 5.1.0) and on the middleware itself — releases the port, kicks with `SERVER_SHUTDOWN`, drains, and deregisters. `handleSignals: false` lets the app own shutdown. |
+
+New: `ws:cluster-clients` replies `{ clients, instances }` so a caller can tell
+"offline" from "an instance is missing". New config: `heartbeatInterval`,
+`instanceTtl`, `handleSignals`.
+
+**Behaviour changes to know about**
+
+- Only **authenticated** clients appear in query results. Previously a socket
+  inside its `authTimeout` window was listed with `authenticated: false`.
+- `lastMsgTime` in query results for clients on *other* instances is as of the
+  last heartbeat, not the last frame. Own-instance clients are always fresh.
+- Keys are now prefixed. During a rolling upgrade each version only sees its
+  own registry; message delivery is unaffected because it never used it.
+- The `ws_internal:*` events are gone. They were never public.
+- Requires Redis with Lua scripting (any supported version) and works best
+  with snub ≥ 5.1.0, which exposes `prefix`; on older snub the default `snub:`
+  prefix is assumed with a warning.
+
+Covered by `snub-smoke/scenarios/ws/35-ws-instance-registry.js`: prefixed keys
+with TTLs, skewed-clock instances staying registered, SIGTERM deregistering,
+SIGKILL expiring within `instanceTtl` with no stalled query, `cluster-clients`,
+`close()` releasing the port while the process lives, and cross-instance single
+login under skew and under a simultaneous race.
+
 ## 5.1.0 — 2026-08-17
 
 ### Security

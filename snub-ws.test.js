@@ -26,99 +26,151 @@ var snub = new Snub({
 });
 
 function auth(auth, accept) {
-  if (auth.username && auth.password === 'password') return accept({
-    token: '123456',
-  });
+  if (auth.username && auth.password === 'password')
+    return accept({
+      token: '123456',
+    });
   return accept(false);
 }
 
-const snubws1 = new SnubWS({
-  debug: false,
-  port: 8686,
-  multiLogin: false,
-  idleTimeout: 100,
-  auth: auth,
-});
-const snubws2 = new SnubWS({
-  debug: false,
-  port: 8787,
-  multiLogin: false,
-  idleTimeout: 100,
-  auth: auth,
-  includeRaw: true,
-});
-const snubws3 = new SnubWS({
-  debug: false,
-  port: 8888,
-  multiLogin: false,
-  idleTimeout: 100,
-  auth: auth,
-});
+// Every server takes a free port from the OS instead of a fixed one, so the
+// suite cannot collide with whatever else is listening on the machine. Fixed
+// ports made a clash look like an auth or throttle bug: snub-ws only
+// console.error()s a failed listen and carries on, so a share of the test
+// connections silently went to a dead port. beforeAll also probes every port
+// and fails the whole suite up front if a server is not actually listening.
+const net = require('net');
+const port = {}; // ws1, ws2, ws3, na, throttle, offload, sec, secAuthEvent, secDebug
 
-const snubwsNA = new SnubWS({
-  debug: false,
-  multiLogin: true,
-  idleTimeout: 100,
-  auth: false,
-});
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+  });
+}
 
-const ports = [8686, 8787, 8888];
+function assertListening(name, p) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: '127.0.0.1', port: p });
+    sock.once('connect', () => {
+      sock.destroy();
+      resolve();
+    });
+    sock.once('error', (err) =>
+      reject(
+        new Error(
+          `snub-ws server "${name}" is not listening on port ${p} (${err.code}). ` +
+            'Check the "Snub WS server FAILED listening" log above.'
+        )
+      )
+    );
+  });
+}
 
+// The three multiLogin:false servers are used round-robin by the connection
+// tests, so a client may land on any of them.
+let ports = [];
 let next = 0;
 function nextPort() {
-  const port = ports[next];
+  const p = ports[next];
   next = (next + 1) % ports.length; // Wrap around when reaching the end of the array
-  return port;
+  return p;
 }
-snub.use(snubws1);
-snub.use(snubws2);
-snub.use(snubws3);
-snub.use(snubwsNA);
 
-const snubwsThrottle = new SnubWS({
-  debug: false,
-  port: 9001,
-  auth: auth,
-  throttle: [3, 1000],
-});
-snub.use(snubwsThrottle);
+beforeAll(async () => {
+  for (const name of [
+    'ws1',
+    'ws2',
+    'ws3',
+    'na',
+    'throttle',
+    'offload',
+    'sec',
+    'secAuthEvent',
+    'secDebug',
+  ])
+    port[name] = await freePort();
+  ports = [port.ws1, port.ws2, port.ws3];
 
-const snubwsOffload = new SnubWS({
-  debug: false,
-  port: 9002,
-  auth: false,
-  offloadToHttpSize: 100,
-});
-snub.use(snubwsOffload);
+  const servers = {
+    ws1: new SnubWS({
+      debug: false,
+      port: port.ws1,
+      multiLogin: false,
+      idleTimeout: 100,
+      auth: auth,
+    }),
+    ws2: new SnubWS({
+      debug: false,
+      port: port.ws2,
+      multiLogin: false,
+      idleTimeout: 100,
+      auth: auth,
+      includeRaw: true,
+    }),
+    ws3: new SnubWS({
+      debug: false,
+      port: port.ws3,
+      multiLogin: false,
+      idleTimeout: 100,
+      auth: auth,
+    }),
+    na: new SnubWS({
+      debug: false,
+      port: port.na,
+      multiLogin: true,
+      idleTimeout: 100,
+      auth: false,
+    }),
+    throttle: new SnubWS({
+      debug: false,
+      port: port.throttle,
+      auth: auth,
+      throttle: [3, 1000],
+    }),
+    offload: new SnubWS({
+      debug: false,
+      port: port.offload,
+      auth: false,
+      offloadToHttpSize: 100,
+    }),
+    // Dedicated servers for the S9 reserved-event-name tests. multiLogin is
+    // left on so an "attacker" and a "victim" client can be connected at the
+    // same time.
+    sec: new SnubWS({
+      debug: false,
+      port: port.sec,
+      multiLogin: true,
+      auth: auth,
+    }),
+    // auth delegated to a bus event rather than a function, so the event name
+    // itself has to be reserved.
+    secAuthEvent: new SnubWS({
+      debug: false,
+      port: port.secAuthEvent,
+      multiLogin: true,
+      auth: 'sec-auth-check',
+    }),
+    // debug on, so the drop diagnostics are actually emitted.
+    secDebug: new SnubWS({
+      debug: true,
+      port: port.secDebug,
+      multiLogin: true,
+      auth: auth,
+    }),
+  };
+  for (const server of Object.values(servers)) snub.use(server);
 
-// Dedicated servers for the S9 reserved-event-name tests. multiLogin is left on
-// so an "attacker" and a "victim" client can be connected at the same time.
-const snubwsSec = new SnubWS({
-  debug: false,
-  port: 9101,
-  multiLogin: true,
-  auth: auth,
+  // uWS reports the listen result through a callback; give it a tick before
+  // probing so a genuine failure is reported as such rather than as a race.
+  await justWait(50);
+  for (const [name, p] of Object.entries(port)) await assertListening(name, p);
 });
-snub.use(snubwsSec);
-
-// auth delegated to a bus event rather than a function, so the event name itself
-// has to be reserved.
-const snubwsSecAuthEvent = new SnubWS({
-  debug: false,
-  port: 9102,
-  multiLogin: true,
-  auth: 'sec-auth-check',
-});
-snub.use(snubwsSecAuthEvent);
-
-// debug on, so the drop diagnostics are actually emitted.
-const snubwsSecDebug = new SnubWS({
-  debug: true,
-  port: 9103,
-  multiLogin: true,
-  auth: auth,
-});
-snub.use(snubwsSecDebug);
 
 var snub2 = new Snub({
   host: 'localhost',
@@ -185,7 +237,7 @@ test('Connect/Disconnect to snub-ws web socket server with socket auth', async f
 
 test('Connect/Disconnect to snub-ws web socket server with no auth', async function () {
   let didAuth = false;
-  var socketClient = new Ws('ws://localhost:8585', {
+  var socketClient = new Ws('ws://localhost:' + port.na, {
     onmessage: (e) => {
       try {
         var [key, value] = JSON.parse(e.data);
@@ -221,18 +273,15 @@ test('Bulk connections', async function () {
     reply(event.payload * 2);
   });
 
-
   let disconnectCount = 0;
   snub.on('ws:client-disconnected', async (event, reply) => {
     disconnectCount++;
     // console.log('Client disconnected:', event.payload)
-  }
-  );
+  });
   let updateCount = 0;
   snub.on('ws:client-updated', async (event, reply) => {
     updateCount++;
-  }
-  );
+  });
 
   const starTrekCharacters = [
     'james-t-kirk',
@@ -431,8 +480,6 @@ test('Bulk connections', async function () {
   expect(metaCheck1[1].meta.likable).toBe(true);
   expect(metaCheck1[0].meta.episode).toBe(undefined);
 
- 
-
   // close connections from client
   connections.get('william-riker').close();
   connections.get('data').close();
@@ -452,7 +499,7 @@ test('kick:* passes kick reason to client (B5 regression)', async function () {
   let clientId = null;
   let kickReason = null;
 
-  const client = new Ws('ws://localhost:8585', {
+  const client = new Ws('ws://localhost:' + port.na, {
     onmessage: (e) => {
       const [key, value] = JSON.parse(e.data);
       if (key === '_acceptAuth') clientId = value._id;
@@ -474,7 +521,7 @@ test('Outbound dedup suppresses identical messages within 3s, resets after (B4 r
   let clientId = null;
   let received = 0;
 
-  const client = new Ws('ws://localhost:8585', {
+  const client = new Ws('ws://localhost:' + port.na, {
     onmessage: (e) => {
       const [key, value] = JSON.parse(e.data);
       if (key === '_acceptAuth') clientId = value._id;
@@ -504,8 +551,12 @@ test('Throttle kicks client after exceeding message rate limit (M17)', async fun
   let clientId = null;
   let kickReason = null;
 
-  const client = new Ws('ws://localhost:9001', {
-    onopen: () => client.json(['_auth', { username: 'throttle-test', password: 'password' }]),
+  const client = new Ws('ws://localhost:' + port.throttle, {
+    onopen: () =>
+      client.json([
+        '_auth',
+        { username: 'throttle-test', password: 'password' },
+      ]),
     onmessage: (e) => {
       const [key, value] = JSON.parse(e.data);
       if (key === '_acceptAuth') clientId = value._id;
@@ -530,7 +581,7 @@ test('Large messages are offloaded to HTTP and retrievable (M19)', async functio
   let clientId = null;
   let offloadId = null;
 
-  const client = new Ws('ws://localhost:9002', {
+  const client = new Ws('ws://localhost:' + port.offload, {
     onmessage: (e) => {
       const [key, value] = JSON.parse(e.data);
       if (key === '_acceptAuth') clientId = value._id;
@@ -547,11 +598,16 @@ test('Large messages are offloaded to HTTP and retrievable (M19)', async functio
   await waitFor(() => offloadId !== null);
 
   const body = await new Promise((resolve, reject) => {
-    http.get('http://localhost:9002/?offload=' + offloadId, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => resolve(data));
-    }).on('error', reject);
+    http
+      .get(
+        'http://localhost:' + port.offload + '/?offload=' + offloadId,
+        (res) => {
+          let data = '';
+          res.on('data', (chunk) => (data += chunk));
+          res.on('end', () => resolve(data));
+        }
+      )
+      .on('error', reject);
   });
 
   const [event, payload] = JSON.parse(body);
@@ -565,7 +621,7 @@ test('Messages sent from a second snub instance reach connected clients (M20)', 
   let clientId = null;
   let received = null;
 
-  const client = new Ws('ws://localhost:8585', {
+  const client = new Ws('ws://localhost:' + port.na, {
     onmessage: (e) => {
       const [key, value] = JSON.parse(e.data);
       if (key === '_acceptAuth') clientId = value._id;
@@ -575,13 +631,65 @@ test('Messages sent from a second snub instance reach connected clients (M20)', 
 
   await waitFor(() => clientId !== null);
 
-  snub2.poly('ws:send:' + clientId, ['cross-instance', 'hello-from-snub2']).send();
+  snub2
+    .poly('ws:send:' + clientId, ['cross-instance', 'hello-from-snub2'])
+    .send();
 
   await waitFor(() => received !== null);
   expect(received).toBe('hello-from-snub2');
 
   client.close();
 }, 5000);
+
+test('close() kicks clients, releases the port and deregisters (5.2.0)', async function () {
+  const IORedis = require('ioredis');
+  // Same connection options as the suite's snub, or the mock hands back a different store.
+  const admin = new IORedis({ host: 'localhost', password: '', db: 8 });
+  const p = await freePort();
+  const middleware = new SnubWS({
+    debug: false,
+    port: p,
+    auth: false,
+    handleSignals: false,
+    heartbeatInterval: 100,
+  });
+  snub.use(middleware);
+  await justWait(50);
+  await assertListening('close-test', p);
+
+  let kickReason = null;
+  let acceptedId = null;
+  const client = new Ws('ws://localhost:' + p, {
+    onmessage: (e) => {
+      const [key, value] = JSON.parse(e.data);
+      if (key === '_acceptAuth') acceptedId = value._id;
+      if (key === '_kickConnection') kickReason = value;
+    },
+  });
+  await waitFor(() => acceptedId !== null);
+  const instanceId = acceptedId.split(';')[0];
+  // Registration and the client mirror are both asynchronous redis writes.
+  let registered = false;
+  let mirrored = 0;
+  const poll = setInterval(async () => {
+    registered =
+      (await admin.zscore('snub:_snubws_instance', instanceId)) !== null;
+    mirrored = await admin.hlen('snub:_snubws_clients:' + instanceId);
+  }, 20);
+  await waitFor(() => registered && mirrored === 1);
+  clearInterval(poll);
+
+  await middleware.close();
+  expect(kickReason).toBe('SERVER_SHUTDOWN');
+  expect(await admin.zscore('snub:_snubws_instance', instanceId)).toBe(null);
+  expect(await admin.exists('snub:_snubws_clients:' + instanceId)).toBe(0);
+  await expect(assertListening('close-test', p)).rejects.toThrow(
+    /not listening/
+  );
+  // idempotent
+  await middleware.close();
+  client.close();
+}, 10000);
 
 // --- S9: clients must not be able to address snub-ws' own control events ---
 //
@@ -600,7 +708,7 @@ test('Client cannot reach parameterised control events (S9)', async function () 
   let victimGotChannelLegit = false;
   const attackerReplies = [];
 
-  const victim = new Ws('ws://localhost:9101', {
+  const victim = new Ws('ws://localhost:' + port.sec, {
     onopen: () =>
       victim.json(['_auth', { username: 'sec-victim', password: 'password' }]),
     onmessage: (e) => {
@@ -614,7 +722,7 @@ test('Client cannot reach parameterised control events (S9)', async function () 
     },
   });
 
-  const attacker = new Ws('ws://localhost:9101', {
+  const attacker = new Ws('ws://localhost:' + port.sec, {
     onopen: () =>
       attacker.json([
         '_auth',
@@ -692,7 +800,7 @@ test('Client cannot forge lifecycle or underscore-prefixed events (S9)', async f
 
   let clientId = null;
   let pong = null;
-  const client = new Ws('ws://localhost:9101', {
+  const client = new Ws('ws://localhost:' + port.sec, {
     onopen: () =>
       client.json(['_auth', { username: 'sec-forger', password: 'password' }]),
     onmessage: (e) => {
@@ -737,7 +845,7 @@ test('Unauthenticated clients cannot reach app handlers (S9)', async function ()
   snub.on('ws:sec-app-event', (payload) => received.push(payload.payload));
 
   let clientId = null;
-  const client = new Ws('ws://localhost:9101', {
+  const client = new Ws('ws://localhost:' + port.sec, {
     onmessage: (e) => {
       const [key, value] = JSON.parse(e.data);
       if (key === '_acceptAuth') clientId = value._id;
@@ -767,7 +875,7 @@ test('Non-string event names are ignored without killing the socket (S9)', async
   snub.on('ws:sec-shape-event', (payload) => received.push(payload.payload));
 
   let clientId = null;
-  const client = new Ws('ws://localhost:9101', {
+  const client = new Ws('ws://localhost:' + port.sec, {
     onopen: () =>
       client.json(['_auth', { username: 'sec-shape', password: 'password' }]),
     onmessage: (e) => {
@@ -805,7 +913,7 @@ test('App events containing a colon are not over-blocked (S9)', async function (
   );
 
   let clientId = null;
-  const client = new Ws('ws://localhost:9101', {
+  const client = new Ws('ws://localhost:' + port.sec, {
     onopen: () =>
       client.json(['_auth', { username: 'sec-rooms', password: 'password' }]),
     onmessage: (e) => {
@@ -833,7 +941,7 @@ test('Configured auth event is not client-sendable (S9)', async function () {
 
   let clientId = null;
   const replies = [];
-  const client = new Ws('ws://localhost:9102', {
+  const client = new Ws('ws://localhost:' + port.secAuthEvent, {
     onopen: () =>
       client.json(['_auth', { username: 'sec-authed', password: 'password' }]),
     onmessage: (e) => {
@@ -876,7 +984,7 @@ test('Dropped inbound events are diagnosable under config.debug (S9)', async fun
 
   try {
     let clientId = null;
-    const client = new Ws('ws://localhost:9103', {
+    const client = new Ws('ws://localhost:' + port.secDebug, {
       onmessage: (e) => {
         const [key, value] = JSON.parse(e.data);
         if (key === '_acceptAuth') clientId = value._id;
@@ -908,7 +1016,9 @@ test('Dropped inbound events are diagnosable under config.debug (S9)', async fun
       )
     ).toBe(true);
     expect(
-      dropped.some((w) => w.includes('_kickConnection') && w.includes('_ prefixed'))
+      dropped.some(
+        (w) => w.includes('_kickConnection') && w.includes('_ prefixed')
+      )
     ).toBe(true);
 
     client.close();

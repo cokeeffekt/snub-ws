@@ -124,6 +124,16 @@ SnubWS({
   // Additional event names that clients are blocked from sending. Matched on
   // the first ':' segment, so 'admin' also blocks 'admin:anything'.
   internalWsEvents: [],
+
+  // Cluster membership. Each instance heartbeats into Redis every
+  // heartbeatInterval ms and is considered gone after instanceTtl ms without
+  // one. Liveness is judged on Redis' clock, so host clocks need not agree.
+  heartbeatInterval: 5000,
+  instanceTtl: 15000,
+
+  // Install SIGINT/SIGTERM/SIGUSR2 handlers that call close() and then exit.
+  // Set false to own shutdown yourself — see Graceful shutdown.
+  handleSignals: true,
 })
 ```
 
@@ -408,7 +418,25 @@ const inRoom = await snub.mono('ws:channel-clients', ['room1']).awaitReply();
 const inRooms = await snub.mono('ws:channel-clients', ['room1', 'room2']).awaitReply();
 ```
 
-All queries return an array of client state objects (see shape above). Queries fan out to all running instances and aggregate the results.
+All queries return an array of client state objects (see shape above) for every
+**authenticated** client on every live instance. Each instance mirrors its clients
+into Redis, so a query is a Redis read — it never waits on other instances to
+answer, and a crashed instance's clients drop out within `instanceTtl`. `meta`
+and `channels` are mirrored as they change; `lastMsgTime` is refreshed once per
+heartbeat.
+
+When you need to know *which* instances an answer covers — to tell "offline"
+from "an instance is missing" — use `cluster-clients`:
+
+```js
+const { clients, instances } = await snub.mono('ws:cluster-clients').awaitReply();
+// clients:   same shape as above
+// instances: ids of every instance that was alive when the answer was built
+
+// Optional filter, same semantics as the queries above
+await snub.mono('ws:cluster-clients', { ids: ['alice'] }).awaitReply();
+await snub.mono('ws:cluster-clients', { channels: ['room1'] }).awaitReply();
+```
 
 ---
 
@@ -439,7 +467,7 @@ snub.on('ws:client-failedauth', function (state) {
 
 ## Large message offloading
 
-When `offloadToHttpSize` is set and an outbound message exceeds that size, the payload is stored in Redis with a 30-second TTL and the client receives a redirect instead:
+When `offloadToHttpSize` is set and an outbound message exceeds that size, the payload is stored in Redis (under the snub prefix, `_snubws_offload:<id>`) with a 30-second TTL and the client receives a redirect instead:
 
 ```json
 ["_offload", "a3f9...hex32chars"]
@@ -457,17 +485,57 @@ The server responds with the original JSON message payload (`Content-Type: appli
 
 ## Multi-instance
 
-Each `snub-ws` instance registers itself in Redis. Query events (`connected-clients`, `channel-clients`, `get-clients`) fan out to all live instances and aggregate results. Send events target clients on whichever instance holds them.
+Run one `snub-ws` per process, as many processes as you like, all pointed at
+the same Redis and snub `prefix`. Instances need each other for three things,
+and all three go through Redis rather than through the bus:
 
-Each instance is identified by `config.instanceId` (defaults to PID + random suffix). Use a unique `instanceId` per process if running multiple instances on the same host.
+- **Membership.** Each instance heartbeats into the sorted set
+  `<prefix>_snubws_instance` every `heartbeatInterval` and is swept after
+  `instanceTtl` without one. Scores come from Redis `TIME`, so a host whose
+  clock is off is neither evicted nor kept alive by mistake. A crashed instance
+  disappears within `instanceTtl`; a signalled or `close()`d one removes itself
+  immediately.
+- **Client state.** Each instance mirrors its authenticated clients into
+  `<prefix>_snubws_clients:<instanceId>`, refreshed with the heartbeat and
+  expiring with it. The query events read those hashes — see Query.
+- **Single login.** With `multiLogin: false`, an accepted login claims
+  `<prefix>_snubws_login:<username>` atomically and learns who held it before;
+  that session is kicked with `DUPE_LOGIN` wherever it is connected. Two
+  simultaneous logins on different instances therefore always leave exactly one.
+
+Message delivery does not touch any of this: every `send`, `kick`, channel and
+meta event is broadcast on the bus and each instance acts on the clients it
+holds.
+
+Every key is namespaced by the snub `prefix`, so separate deployments sharing a
+Redis database never see each other. Each instance is identified by
+`config.instanceId` (defaults to PID + random suffix).
 
 ---
 
 ## Graceful shutdown
 
-On `SIGINT`, `SIGTERM`, or `SIGUSR2`:
+`snub.use()` returns a handle (snub ≥ 5.1.0), and the middleware itself
+exposes the same `close()`:
 
-1. All connected clients are kicked with `SERVER_SHUTDOWN`
-2. 500 ms drain window allows close handshakes to complete
-3. The instance is removed from Redis
-4. `process.exit(0)`
+```js
+const ws = SnubWs({ port: 8585, handleSignals: false });
+const handle = await snub.use(ws);
+
+// later
+await handle.close();   // or: await ws.close()
+```
+
+`close()`:
+
+1. Stops accepting connections and releases the port
+2. Kicks every client with `SERVER_SHUTDOWN`
+3. Waits 500 ms for close handshakes to complete
+4. Removes the instance, its client mirror and its login claims from Redis
+
+It resolves once that is done and is safe to call more than once. It does not
+touch the snub instance — that is the app's to close.
+
+With `handleSignals: true` (the default) `SIGINT`, `SIGTERM` and `SIGUSR2` run
+`close()` and then `process.exit(0)`. Set it to `false` if your app owns
+shutdown and wants to drain other work first.
