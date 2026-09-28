@@ -10,9 +10,8 @@
   "scripts": {
     "test": "jest --runInBand --forceExit",
     "redis": "docker run --rm --name redis-snub -d -p 6379:6379 redis:4.0-alpine",
-    "debug": "npx pm2 del all; npx pm2 start examples/websocket-server.js -i 4 && npx pm2 restart all && npx pm2 logs",
-    "prune-uws": "node scripts/prune-uws.js",
-    "publish": "npm publish"
+    "debug": "npx pm2 del all; npx pm2 start examples/basic-server.js -i 4 && npx pm2 restart all && npx pm2 logs",
+    "prune-uws": "node scripts/prune-uws.js"
   },
   "repository": {
     "type": "git",
@@ -23,7 +22,7 @@
     "websocket"
   ],
   "author": "Patrik Hartwig",
-  "license": "ISC",
+  "license": "MIT",
   "bugs": {
     "url": "https://github.com/cokeeffekt/snub-ws/issues"
   },
