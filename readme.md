@@ -94,6 +94,12 @@ SnubWS({
   // Minimum: 5 minutes. Maximum: 960 seconds (uWS v20 limit).
   idleTimeout: 960000,
 
+  // Milliseconds between websocket ping frames sent to every open socket, so
+  // a proxy or load balancer in front does not reap quiet connections. Set it
+  // below the shortest idle timeout on the path. Not client activity: it never
+  // moves lastMsgTime or postpones IDLE_TIMEOUT. Minimum 1000, 0 = off.
+  keepaliveInterval: 60000,
+
   // Restrict WebSocket upgrades to listed origins. null = allow all.
   // e.g. ['https://example.com', 'https://app.example.com']
   // Also scopes CORS on the HTTP offload route: when set, only these origins
@@ -249,8 +255,12 @@ dropped.
 | `_acceptAuth` | server | Authentication accepted |
 | `_kickConnection` | server | Server is about to close the connection — includes reason string |
 | `_offload` | server | Message too large; fetch from HTTP — see Large messages |
-| `_ping` | server | Server keepalive ping |
+| `_ping` | server | Sent shortly before a quiet client reaches `idleTimeout` |
 | `_pong` | server | Response to client `_ping` |
+
+The transport keepalive (`keepaliveInterval`) is not in this table because it is
+not a message: it is a websocket ping control frame, answered by the browser or
+websocket library itself and never delivered to `onmessage`.
 
 ---
 

@@ -1,5 +1,30 @@
 # Changelog
 
+## 5.3.0 — 2026-09-29
+
+### Transport keepalive, separate from idle detection
+
+`idleTimeout` was doing two jobs. It decided when a quiet client was away, and
+its `_ping` shortly before that deadline was the only frame a quiet socket ever
+received — about 930 s in at the default, and never sooner than 270 s because
+of the five minute floor. A load balancer or proxy with a shorter idle timeout
+(300 s is common) closed every quiet connection first, and no setting could
+prevent it.
+
+New config `keepaliveInterval` (default 60000 ms, minimum 1000, `0` disables)
+sends a websocket ping control frame to every open socket on that interval.
+
+- It is not client activity. The pong is answered by the peer's websocket
+  stack and never reaches the message handler, so `lastMsgTime` does not move
+  and `IDLE_TIMEOUT` fires exactly when it did before.
+- No client change. Browsers and websocket libraries answer ping frames
+  themselves; nothing is delivered to `onmessage`.
+- `idleTimeout`, its clamps and the `_ping` message are unchanged.
+
+Covered by `snub-smoke/scenarios/ws/36-ws-keepalive.js`: ping cadence, an
+unmoved `lastMsgTime`, `0` sending nothing, and a quiet socket outliving a
+proxy that reaps on server→client silence while one without keepalive is cut.
+
 ## 5.2.0 — 2026-09-23
 
 ### Instance tracking rewritten

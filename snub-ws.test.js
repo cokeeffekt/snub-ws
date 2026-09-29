@@ -93,6 +93,7 @@ beforeAll(async () => {
     'sec',
     'secAuthEvent',
     'secDebug',
+    'keepalive',
   ])
     port[name] = await freePort();
   ports = [port.ws1, port.ws2, port.ws3];
@@ -162,6 +163,14 @@ beforeAll(async () => {
       port: port.secDebug,
       multiLogin: true,
       auth: auth,
+    }),
+    // clamped up to the 1000 ms minimum
+    keepalive: new SnubWS({
+      debug: false,
+      port: port.keepalive,
+      multiLogin: true,
+      auth: auth,
+      keepaliveInterval: 10,
     }),
   };
   for (const server of Object.values(servers)) snub.use(server);
@@ -1119,6 +1128,47 @@ function Ws(url, opts) {
   return $;
   function noop() {}
 }
+
+test('Keepalive pings an idle socket without counting as client activity', async function () {
+  let clientId = null;
+  const pings = [];
+  const messages = [];
+  const client = new WebSocket('ws://localhost:' + port.keepalive);
+  client.on('open', () =>
+    client.send(
+      JSON.stringify([
+        '_auth',
+        { username: 'keepalive-idle', password: 'password' },
+      ])
+    )
+  );
+  client.on('ping', () => pings.push(Date.now()));
+  client.on('message', (data) => {
+    const [key, value] = JSON.parse(data.toString());
+    if (key === '_acceptAuth') clientId = value._id;
+    else messages.push(key);
+  });
+
+  await waitFor(() => clientId !== null);
+  const before = await snub
+    .mono('ws:get-clients', ['keepalive-idle'])
+    .awaitReply();
+  expect(before.length).toBe(1);
+
+  await waitFor(() => pings.length >= 3);
+  // the 10 ms asked for is clamped to a second
+  expect(pings[2] - pings[1]).toBeGreaterThan(800);
+
+  const after = await snub
+    .mono('ws:get-clients', ['keepalive-idle'])
+    .awaitReply();
+  expect(after[0].lastMsgTime).toBe(before[0].lastMsgTime);
+  // a control frame, not a message the app would have to ignore
+  expect(messages).toEqual([]);
+
+  client.close();
+  await justWait(200);
+}, 10000);
 
 function justWait(ms = 1000) {
   return new Promise((resolve) => {

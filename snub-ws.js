@@ -39,6 +39,7 @@ const DEFAULT_CONFIG = {
   authTimeout: 3000,
   throttle: [50, 5000], // X number of messages per Y milliseconds.
   idleTimeout: 960 * 1000, // disconnect if nothing has come from client in x ms (uWS v20 max: 960 seconds)
+  keepaliveInterval: 60 * 1000, // ms between transport pings to every socket, 0 = off
   allowedOrigins: null, // array of allowed origins e.g. ['https://example.com'], null = allow all
   maxConnections: 0, // max simultaneous connections, 0 = unlimited
   instanceId: process.pid,
@@ -63,6 +64,13 @@ module.exports = function (config) {
   };
   config.idleTimeout = Math.max(config.idleTimeout, 1000 * 60 * 5); // min 5 minutes
   config.idleTimeout = Math.min(960 * 1000, config.idleTimeout); // uWS v20 max 960 seconds
+  // Separate from idleTimeout on purpose: that one decides when a quiet client
+  // is away, this one only keeps bytes moving so a proxy or balancer in front
+  // does not reap the connection first.
+  config.keepaliveInterval =
+    config.keepaliveInterval > 0
+      ? Math.max(1000, Number(config.keepaliveInterval))
+      : 0;
 
   config.offloadToHttpSize =
     config.offloadToHttpSize < 1 ? null : config.offloadToHttpSize;
@@ -294,6 +302,13 @@ module.exports = function (config) {
     }, 1000 * 10);
     idleTimer.unref();
 
+    const keepaliveTimer = config.keepaliveInterval
+      ? setInterval(() => {
+          wsClients.clients().forEach((client) => client.keepalive());
+        }, config.keepaliveInterval)
+      : null;
+    if (keepaliveTimer) keepaliveTimer.unref();
+
     // Stop listening, drain the clients, then deregister. Safe to call more
     // than once. Leaves the snub instance alone -- that belongs to the app.
     let listenSocket = null;
@@ -302,6 +317,7 @@ module.exports = function (config) {
       closed = true;
       clearInterval(heartbeatTimer);
       clearInterval(idleTimer);
+      clearInterval(keepaliveTimer);
       if (config.handleSignals)
         for (const signal of SIGNALS) process.off(signal, onSignal);
       // Release the port first so a balancer stops sending new connections
@@ -1009,6 +1025,18 @@ class WsClient {
         });
     } catch (error) {
       console.error('Error sending event', event, error, message);
+    }
+  }
+
+  // A websocket ping frame rather than a message: the peer's websocket stack
+  // answers it below the application, so nothing reaches onMessage and
+  // lastMsgTime is left alone. A client kept alive this way still idles out.
+  keepalive() {
+    if (this.#internal.closing) return;
+    try {
+      this.#ws.ping();
+    } catch (error) {
+      // uWS throws on a socket that closed under us; onClose tidies up
     }
   }
 

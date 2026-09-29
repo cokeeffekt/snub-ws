@@ -33,6 +33,14 @@ export interface SnubWsConfig {
   idleTimeout?: number;
 
   /**
+   * Ms between websocket ping frames sent to every open socket, so a proxy or
+   * load balancer with a shorter idle timeout than `idleTimeout` does not reap
+   * quiet connections. Does not count as client activity: `lastMsgTime` and
+   * `IDLE_TIMEOUT` are unaffected. Min 1000, `0` disables. Default: 60000
+   */
+  keepaliveInterval?: number;
+
+  /**
    * Allowed WebSocket upgrade origins. `null` allows all origins.
    * e.g. `['https://example.com']`. Default: null
    */
