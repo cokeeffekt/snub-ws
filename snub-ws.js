@@ -1117,6 +1117,12 @@ class WsClient {
   }
 
   setMeta(metaObj) {
+    this.#internal.metaObj = this.#mergeMeta(metaObj);
+    this.#store.persist(this);
+    snub.mono('ws:client-updated', this.state).send();
+  }
+
+  #mergeMeta(metaObj) {
     // metaObj should be an object with string number bool array values only
     // array values should be strings or numbers only
     // strings should be less than 128 characters
@@ -1146,9 +1152,7 @@ class WsClient {
         newMeta[k] = value;
       }
     });
-    this.#internal.metaObj = newMeta;
-    this.#store.persist(this);
-    snub.mono('ws:client-updated', this.state).send();
+    return newMeta;
   }
 
   addChannel(arrayOfChannels) {
@@ -1198,7 +1202,12 @@ class WsClient {
       );
     }
 
-    const authObj = { ...this.state, ...authPayload };
+    // The client's payload must not override the server's view of the
+    // connection: an auth handler that addresses the connection by `id` (e.g.
+    // ws:set-meta:<id>) or checks `remoteAddress` would otherwise act on
+    // whatever the client sent. Only `username` comes from the client.
+    const { username, ...serverState } = this.state;
+    const authObj = { username, ...authPayload, ...serverState };
 
     const authCheck = (validAuthOrObj, err) => {
       if (err) {
@@ -1235,6 +1244,14 @@ class WsClient {
   }
 
   async #acceptAuth(authPayload, validAuthOrObj = {}) {
+    // `_meta` from the auth handler is set before the connection counts as
+    // authenticated, so no event of it is handled without its meta (a separate
+    // ws:set-meta lands some time after _acceptAuth, and the client can send
+    // events before then). It stays on the server, it is not sent in
+    // _acceptAuth.
+    const { _meta, ...acceptObj } = validAuthOrObj;
+    if (_meta && typeof _meta === 'object')
+      this.#internal.metaObj = this.#mergeMeta(_meta);
     this.#internal.authenticated = true;
     this.#internal.auth = authPayload;
 
@@ -1258,7 +1275,7 @@ class WsClient {
 
     // Kicked or closed while the claim was in flight.
     if (!this.state.authenticated || this.#internal.closing) return;
-    this.send('_acceptAuth', { _id: this.state.id, ...validAuthOrObj });
+    this.send('_acceptAuth', { _id: this.state.id, ...acceptObj });
     this.#store.persist(this);
     snub.mono('ws:client-authenticated', this.state).send();
   }

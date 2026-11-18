@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Security: auth handlers see the real connection, and can set meta atomically
+
+- **The `_auth` payload could override the client state.** The auth handler got
+  `{ ...state, ...authPayload }`, so a client could send its own `id`,
+  `remoteAddress`, `authenticated` or `meta`. An app that answers auth with
+  `ws:set-meta:<authObj.id>` then set the meta on another connection (or none),
+  and the client's own connection kept running with no meta. Now the state
+  wins; only `username` comes from the payload.
+- **Meta set from the auth handler arrived late.** `ws:set-meta` is a separate
+  bus message that lands some time after `_acceptAuth`; a client can send
+  events in between, and an interceptor that restricts clients by their meta
+  saw none. An auth answer may now carry `_meta`: it is set on the client
+  before it counts as authenticated, so the first event already has it.
+  `_meta` is not sent to the client in `_acceptAuth`.
+
+No change for clients. Apps that set meta from their auth handler should
+answer with `{ _meta }` instead of sending `ws:set-meta`.
+
 ## 5.3.0 — 2026-09-29
 
 ### Transport keepalive, separate from idle detection
