@@ -170,9 +170,9 @@ snub.use(SnubWS({
 `accept` can be called with:
 - `true` — accept, `username` is taken from `authPayload.username`
 - `false` — deny (client is kicked with `AUTH_FAIL`)
-- `object` — accept and merge into the `_acceptAuth` reply sent to client
+- `object` — accept and merge into the `_acceptAuth` reply sent to client. A `_meta` key is not sent: it is set as the client's [meta](#meta) before the client counts as authenticated, so the client's first event already carries it (a `ws:set-meta` sent from the handler lands some time after `_acceptAuth`)
 
-The `authPayload` argument is the object the client sent in its `_auth` message, merged with the current client state (so `authPayload.remoteAddress` etc. are available).
+The `authPayload` argument is the object the client sent in its `_auth` message, merged with the current client state (so `authPayload.remoteAddress` etc. are available). The client state wins: a client can't set `id`, `remoteAddress` or any other state key through its `_auth` payload, only `username`.
 
 ### Snub event
 
@@ -184,7 +184,7 @@ snub.use(SnubWS({ auth: 'authenticate-client' }));
 snub.on('ws:authenticate-client', function (authPayload, reply) {
   // authPayload includes username, remoteAddress, etc.
   if (authPayload.username === 'admin')
-    return reply({ role: 'admin' }); // merged into _acceptAuth
+    return reply({ role: 'admin', _meta: { role: 'admin' } }); // role merged into _acceptAuth, _meta set as the client's meta
   reply(false);
 });
 ```
@@ -213,7 +213,7 @@ On success the server responds:
 ["_acceptAuth", { "_id": "connectionId" }]
 ```
 
-Additional keys from the `accept(object)` call are included in this response.
+Additional keys from the `accept(object)` call are included in this response, except `_meta`.
 
 On failure the client is kicked with reason `AUTH_FAIL`.
 
@@ -389,6 +389,8 @@ Automatic kick reasons:
 ## Meta
 
 Arbitrary key/value data attached to a client. Included in all `from` payloads and query results. Updated values are broadcast via `ws:client-updated`.
+
+Meta the auth handler returns as `_meta` (see [Auth](#auth)) is in place before the client's first event. Use that for anything an interceptor or handler relies on to restrict the client.
 
 ```js
 // set by username or ID

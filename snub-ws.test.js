@@ -40,7 +40,7 @@ function auth(auth, accept) {
 // connections silently went to a dead port. beforeAll also probes every port
 // and fails the whole suite up front if a server is not actually listening.
 const net = require('net');
-const port = {}; // ws1, ws2, ws3, na, throttle, offload, sec, secAuthEvent, secDebug
+const port = {}; // ws1, ws2, ws3, na, throttle, offload, sec, secAuthEvent, secDebug, authMeta
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -72,6 +72,9 @@ function assertListening(name, p) {
   });
 }
 
+// auth objects the authMeta server's handler was called with
+const authMetaCalls = [];
+
 // The three multiLogin:false servers are used round-robin by the connection
 // tests, so a client may land on any of them.
 let ports = [];
@@ -94,6 +97,7 @@ beforeAll(async () => {
     'secAuthEvent',
     'secDebug',
     'keepalive',
+    'authMeta',
   ])
     port[name] = await freePort();
   ports = [port.ws1, port.ws2, port.ws3];
@@ -171,6 +175,16 @@ beforeAll(async () => {
       multiLogin: true,
       auth: auth,
       keepaliveInterval: 10,
+    }),
+    // auth handler that records what it was given and answers with _meta
+    authMeta: new SnubWS({
+      debug: false,
+      port: port.authMeta,
+      multiLogin: true,
+      auth: (authObj, accept) => {
+        authMetaCalls.push(authObj);
+        accept({ _meta: { role: 'guest', tags: ['a', 'b'] }, extra: 1 });
+      },
     }),
   };
   for (const server of Object.values(servers)) snub.use(server);
@@ -1168,6 +1182,72 @@ test('Keepalive pings an idle socket without counting as client activity', async
 
   client.close();
   await justWait(200);
+}, 10000);
+
+// Connects to the authMeta server and resolves on _acceptAuth. With `probe`,
+// the client sends an event in the same tick it sees _acceptAuth, the earliest
+// it can act.
+function authMetaConnect(authPayload, { probe = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const client = new WebSocket('ws://localhost:' + port.authMeta);
+    client.on('open', () =>
+      client.send(JSON.stringify(['_auth', authPayload]))
+    );
+    client.on('message', (data) => {
+      const [key, value] = JSON.parse(data.toString());
+      if (key !== '_acceptAuth') return;
+      if (probe) client.send(JSON.stringify(['auth-meta-probe', {}]));
+      resolve({ client, accept: value });
+    });
+    client.on('error', reject);
+  });
+}
+
+test('Auth handler gets the server connection id and address, not client-sent ones', async function () {
+  const victim = await authMetaConnect({ username: 'victim' });
+  const attacker = await authMetaConnect({
+    username: 'attacker',
+    id: victim.accept._id,
+    remoteAddress: '203.0.113.7',
+    authenticated: true,
+  });
+  const authObj = authMetaCalls.find((a) => a.username === 'attacker');
+  // an auth handler addressing the connection by id (ws:set-meta:<id>) must
+  // reach the attacker's own connection, not the victim's
+  expect(authObj.id).toBe(attacker.accept._id);
+  expect(authObj.id).not.toBe(victim.accept._id);
+  expect(authObj.remoteAddress).not.toBe('203.0.113.7');
+  expect(authObj.authenticated).toBe(false);
+  victim.client.close();
+  attacker.client.close();
+}, 10000);
+
+test('_meta from the auth handler is on the connection before its first event', async function () {
+  const expectedMeta = { role: 'guest', tags: ['a', 'b'] };
+  const authenticated = [];
+  const probes = [];
+  snub.on('ws:client-authenticated.authmeta', (state) => {
+    if (state.username === 'meta-racer') authenticated.push(state);
+  });
+  snub.on('ws:auth-meta-probe', (event) => probes.push(event.from));
+
+  const { client } = await authMetaConnect(
+    { username: 'meta-racer' },
+    { probe: true }
+  );
+  await waitFor(() => probes.length > 0 && authenticated.length > 0);
+  expect(probes[0].meta).toEqual(expectedMeta);
+  expect(authenticated[0].meta).toEqual(expectedMeta);
+
+  client.close();
+  snub.off('ws:client-authenticated.authmeta');
+  snub.off('ws:auth-meta-probe');
+}, 10000);
+
+test('_meta stays on the server; the rest of the auth answer reaches the client', async function () {
+  const { client, accept } = await authMetaConnect({ username: 'meta-reader' });
+  expect(accept).toEqual({ _id: accept._id, extra: 1 });
+  client.close();
 }, 10000);
 
 function justWait(ms = 1000) {

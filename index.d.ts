@@ -7,6 +7,11 @@ export interface SnubWsConfig {
    * - `false` — no auth required (default)
    * - `string` — snub event name to send auth payload to; handler must reply with `true`, `false`, or an object
    * - `function` — called with `(authObj, callback)` where callback is `(validAuthOrObj, err?) => void`
+   *
+   * `authObj` is the client's `_auth` payload with the client state on top (the
+   * state wins, except `username`). An object answer is merged into
+   * `_acceptAuth`, except `_meta`, which is set as the client's meta before it
+   * counts as authenticated.
    */
   auth?: false | string | ((authObj: ClientState & Record<string, unknown>, callback: AuthCallback) => void);
 
